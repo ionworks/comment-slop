@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "comment-slop"
+version = "0.1.1"
+description = "Report agent-authored comment slop on the lines you just changed."
+authors = [{ name = "Ionworks Technologies Inc", email = "info@ionworks.com" }]
+readme = { file = "README.md", content-type = "text/markdown" }
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+keywords = ["comments", "linter", "code-review", "claude-code", "agent", "hook"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Quality Assurance",
+]
+# Empty by design: the hook falls back to whatever `python3` is on PATH, so an
+# import is a way for a broken environment to break the edit loop.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1", "pytest-cov>=7.0",
+]
+# The tree-sitter differential, which checks the hand-written lexers against
+# real grammars. Separate because it is the only part that installs anything.
+oracle = [
+    "tree-sitter",
+    "tree-sitter-rust",
+    "tree-sitter-yaml",
+    "tree-sitter-toml",
+    "tree-sitter-typescript",
+    "tree-sitter-dockerfile",
+    "tree-sitter-bash",
+]
+
+[project.scripts]
+comment-slop = "comment_slop:main"
+
+[project.urls]
+Homepage = "https://ionworks.com"
+Repository = "https://github.com/ionworks/comment-slop"
+
+[tool.hatch.build.targets.wheel]
+# The detector only. `src/recalibrate.py` beside it needs numpy/scipy/pandas,
+# so it stays a dev script rather than the package's first dependency.
+packages = ["src/comment_slop.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
