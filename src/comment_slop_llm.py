@@ -187,8 +187,9 @@ def sweep(deadline: float | None = None) -> cs.Sweep:
             if code:
                 pairs.append((b.line, body, code))
         texts = {ln: body for ln, body, _ in pairs}
+        # The model answers keep or not, so what it does not keep is a deletion.
         return [
-            cs.Finding(ln, "narration (model)", texts[ln])
+            cs.Finding(ln, "narration (model)", texts[ln], cs.DELETE)
             for ln in sorted(classify(pairs, deadline))
         ]
 

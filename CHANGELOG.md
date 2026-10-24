@@ -6,6 +6,20 @@ and this package follows [Semantic Versioning](https://semver.org/).
 
 <!-- New release sections are prepended below by the release-packages skill. -->
 
+## [0.3.0] - 2026-10-23
+
+### Breaking changes
+- `Finding` requires an `action` (`delete`, `shorten` or `rewrite`), and the report gains a column for it; code that builds a `Finding` must pass one (#2122)
+
+### Added
+- Each finding says whether to delete or shorten its comment; where a tier objected to one part, `cut:` names it and the rest is judged on its own (#2122)
+- `CHANGELOG.md` entries are checked: one line each, at most 40 words, ending in the PR number, such as `(#123)` (#2122)
+- `--strict`, or `COMMENT_SLOP_STRICT=1` for the hook and commit gate, reports every comment a change adds, except Python docstrings and tool directives (#2122)
+
+### Fixed
+- Fewer false findings: a heading over a group is kept, an exempt line no longer splits a sentence, and `historical` reads dates and "previously measured" as data (#2122)
+- Comments between the props of a JSX tag with type arguments, such as `<Autocomplete<T>`, are checked instead of read as child text (#2377)
+
 ## [0.2.0] - 2026-09-24
 
 ### Breaking changes

@@ -100,10 +100,11 @@ def measure(path: str) -> tuple[list[int], list[int], list[float]] | None:
         s = cs.subject(b)
         if cs.exempt(s):
             continue
-        words.append(len(cs.RAW_WORD.findall(s.body)))
-        # prose_lines, not b.span: it is what the verbose tier compares
+        # prose_rows, not b.span: it is what the verbose tier compares
         # against, so the percentiles stay comparable to what fires.
-        spans.append(cs.prose_lines(s.lines))
+        prose = cs.prose_rows(s.lines)
+        words.append(len(cs.RAW_WORD.findall(" ".join(prose))))
+        spans.append(len(prose))
 
     counted, neutral = cs.density_sets(raw)
     scopes = function_scopes(src) if raw[0].lang == "python" else []

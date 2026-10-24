@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "comment-slop"
-version = "0.2.0"
+version = "0.3.0"
 description = "Report agent-authored comment slop on the lines you just changed."
 authors = [{ name = "Ionworks Technologies Inc", email = "info@ionworks.com" }]
 readme = { file = "README.md", content-type = "text/markdown" }

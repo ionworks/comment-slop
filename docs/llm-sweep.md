@@ -49,6 +49,19 @@ comments it did not send. A batch cap bounds the number of calls, not the time
 they take: three batches against a 120 s timeout is a six-minute stall on a
 single edit.
 
+## A model finding asks for deletion
+
+The model answers keep or not, so a comment it does not keep is reported as
+`delete`, and `score.py` scores it that way. The prompt's seventh class, "a long
+explanation where a short one would do", describes `trim` instead, whose fix is
+a shorter comment, so a finding made on those grounds asks for the wrong fix.
+The sweep only sees what `verbose` let through, which bounds how often that can
+happen, but not by a measured amount.
+
+Dropping the class, or asking for keep / shorten / delete, would align the two.
+Either is a prompt change to measure against the table below before it lands,
+because naming the classes is what carries the sweep's recall.
+
 ## Why it is not in the hook
 
 Run over a real 28-commit branch (21 files, 161 added comment lines) the sweep
@@ -91,8 +104,8 @@ deterministic findings first and batches per file.
 
 On the 116 labelled snapshot. **One run, recorded before the `edit-narration`
 vocabulary fix** — the rows are comparable to each other, not to today's headline,
-which is 95%/85% at fp 4. Re-run the whole table rather than editing one row into
-it.
+which is 91%/77% at fp 7, scoring each finding's action against its label.
+Re-run the whole table rather than editing one row into it.
 
 | path | precision | recall | result |
 |---|---:|---:|---|

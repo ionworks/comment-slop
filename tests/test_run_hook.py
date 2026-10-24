@@ -62,6 +62,14 @@ class TestTheHookWrapperOnlyExitsTwoForFindings:
     def test_a_clean_file_exits_zero(self, clean):
         assert self.run(clean)[0] == 0
 
+    def test_strict_mode_reaches_the_detector(self, tmp_path):
+        """A session turns strict on through the environment, so uv must pass it."""
+        p = tmp_path / "why.py"
+        p.write_text("# The writer holds the lock for one poll.\nx = 1\n")
+        assert self.run(p)[0] == 0
+        code, err = self.run(p, {"COMMENT_SLOP_STRICT": "1"})
+        assert code == 2 and "[strict]" in err
+
     def test_a_broken_uv_cache_does_not_report_findings(self, clean, tmp_path):
         bad = tmp_path / "nocache"
         bad.mkdir(mode=0o000)

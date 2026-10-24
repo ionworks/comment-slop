@@ -48,6 +48,8 @@ essay would otherwise be judged on the 22 words above it is the concrete case.
 | shell `density_max` | 40% | shell has no function scope, so the ratio spans the whole script: PyBaMM p95 = 38.1% over 26 scripts, vcpkg = 38.5% over 89 with its shebangs counted as comments (see below). Set above both |
 | `DENSITY_MIN_COMMENT_LINES` | 3 | floor on comment volume, **not** region size — a region-size floor exempted a 5-line block on a 9-line change, the worst case there is |
 | `MAX_WORDS` | 12 | gate for the opt-in `unreviewed` tier only |
+| `CUT_REST_WORDS` | 8 distinct content words | what a cut must leave of a plain comment for it to be shortened rather than deleted (see below) |
+| `CHANGELOG_VERBOSE_WORDS` | 40 words | a `CHANGELOG.md` entry. PyBaMM p98 = 42 over v24.1–v26.3.1, flagging 6 of 266 (see below) |
 | `LLM_DEADLINE` | 20 s | wall-clock budget for the whole sweep in hook mode |
 
 The threshold sets are kind-specific, not language-specific, with `density` the
@@ -85,8 +87,15 @@ after the adverb, not before it: a participle plus an agent or means phrase
 using the output") or an attributive hyphen ("previously-picked template") states
 runtime order rather than source history. Two lookaheads cover **16 of the 19**,
 with no true finding reading that way. Still missed: a trailing `called
-previously.` and an attributive `the previously installed skills`, both of which
-need the comma or the following noun to be a part of speech a regex cannot see.
+previously.`, which needs the comma to be a part of speech a regex cannot see.
+
+A third lookahead takes the attributive case: a data verb over a bare noun
+("a previously measured OCV", "the previously installed skills") names an input,
+while over `the` or `it` the verb has an object and narrates code ("previously
+saved the file twice"). A subject before the adverb overrides it, since the
+participle is then the sentence's verb ("This previously saved files to local
+storage"). `this` and `that` count as subjects only opening a sentence, because
+mid-sentence they are determiners ("load this previously fitted model").
 
 Net across the corpora: the tier fires 33 times where the bare phrases fire 107,
 and 63 blocks are not reported at all. The 116 human labels score identically
@@ -136,7 +145,7 @@ and `98.2% smaller` still fire.
 
 **Evidence status: precision by construction, not by measurement.** The genre is
 absent from the labelled corpus — the tier changes the base score by nothing
-(95%/85%, tp 76, fp 4, fn 13, with or without it) — and nearly absent from
+(91%/77%, tp 71, fp 7, fn 21, with or without it) — and nearly absent from
 committed code: the only hits across the firing-rate populations are four
 `# measured baseline: ~138 MB` import-footprint annotations in the packages,
 which are exactly the genre. Flood risk is nil and so is corpus evidence of precision. That is expected
@@ -211,13 +220,63 @@ obligation (`have to`, `needs to`), consequence (`which is why`, `hence`,
 
 **Evidence status: precision by construction, not by measurement** — the same
 standing as `benchmark`, and for the same reason. The tier adds zero firings to
-either corpus and leaves the labelled score untouched (95%/85%, tp 76, fp 4,
-fn 13, the same four false positives). A committed corpus cannot price this
+either corpus and leaves the labelled score untouched (91%/77%, tp 71, fp 7,
+fn 21, the same false positives). A committed corpus cannot price this
 genre, because a comment about a change made and unmade on a feature branch is
 deleted, rewritten, or squashed before it is ever committed. The hook fires at
 write time, which is the only moment that population exists. It should be the
 quickest tier to revert if it misfires, and `test_comment_slop.py` pins both
 the two arms and the four shapes that must stay silent.
+
+## What a cut must leave
+
+A tier that objects to part of a comment asks to shorten it when the rest stands
+as a comment, and to delete it otherwise. `CUT_REST_WORDS` is where "stands"
+begins, counted with `words()`: distinct words, stopwords and one-letter tokens
+out, `snake_case` split. Over every plain comment in this repo at `d5c1fe15d`
+whose cut left something no tier would delete, sorted by what was left:
+
+| left | cuts | what it reads as, sampled |
+|---|---:|---|
+| 1–2 | 120 | a fragment |
+| 3–4 | 188 | a label: `List measurements for an instance` under `7.` |
+| 5–8 | 265 | mostly a narrated step: `Parse the validated configuration to create the DataFit object` |
+| 9–12 | 91 | mostly a fact: `Their started_at is an upper bound, not a recorded event` |
+| 13+ | 177 | a fact |
+
+The labels agree where they reach. Base#84 (`Step 6: Detect isolated connected
+components`), base#89 and py-docstring#30 and #31 are slop, and each leaves four
+words or fewer. Base#51, `Test 2: Filter with x_max only`, is the one labelled
+trim, and it leaves three: a miss the floor accepts, since a floor low enough
+to keep it keeps the 5–8 band too.
+
+A doc block's rest needs only a word. There it is the summary line, and deleting
+the docstring to drop a history sentence under `Batch upgrade simulations to the
+new storage format.` would take the API's documentation with it.
+
+## Changelog entries: one line, ending in its PR
+
+A `CHANGELOG.md` entry is judged by three tiers of its own, taken from PyBaMM's
+contributor guideline: "Each entry is a single bullet ending in a PR link".
+`multi-line` and `pr-link` are that sentence, and `verbose` bounds what one line
+may hold. The link must show the number it points at, because PyBaMM's own file
+has `[#5160]` linking `/pull/5129` and `[#5007]` linking `/pull/5008`. A bare
+`(#123)` also closes an entry: a package mirrored out of a private repo cannot
+link its PRs, and a link readers cannot open is worse than none.
+
+`CHANGELOG_VERBOSE_WORDS` is measured on PyBaMM's `CHANGELOG.md` at `b24fdb3` with `entry_words`, which counts a link's text and not its URL:
+
+| releases | entries | median | p95 | p98 | over 40 |
+|---|---:|---:|---:|---:|---:|
+| v21.08 – v24.0 | 317 | 13 | 42 | 48 | 19 |
+| v24.1 – v26.3.1 | 266 | 14 | 33 | 42 | 6 |
+| v26.4.3 – Unreleased | 117 | 37 | 77 | 118 | 50 |
+| whole file | 1,003 | 13 | 49 | 67 | 82 |
+
+At 40 it flags 6 of 266 entries
+over v24.1–v26.3.1, and each of the six runs to two sentences or more. Over that
+window the three tiers pass 248 of 266 entries, and each of the 18 they flag
+breaks the guideline as written.
 
 ## Reference percentiles come from the hook's own functions
 
@@ -322,9 +381,9 @@ changes outlive the numbers they produced:
   language; a `#` run is separate comments we choose to read as a paragraph, and
   only the second is ours to split.
 - **A veto is worse than a wrong tier**, so an over-matching marker costs more
-  than a band can show. The comment is dropped before any tier sees it *and* it
-  splits its block, so its neighbours are measured as a shorter run than the
-  author wrote — and no corpus can see the class, because a vetoed comment is
+  than a band can show. The comment is dropped before any tier sees it *and*,
+  unless a sentence runs through it, it splits its block, so its neighbours are
+  measured as a shorter run than the author wrote — and no corpus can see the class, because a vetoed comment is
   never eligible for sampling. Uppercase-only intent markers (see the README's
   *Tuning*) raise every band 0.3–1.0 points over case-insensitive ones and leave
   every labelled case scoring identically.

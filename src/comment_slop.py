@@ -6,7 +6,8 @@ from __future__ import annotations
 import argparse
 import ast
 import bisect
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 import io
 import itertools
@@ -19,6 +20,9 @@ import tokenize
 import warnings
 
 MAX_WORDS = 12
+# Distinct content words a cut must leave for a plain comment to stand. Fewer is
+# a label or a narrated step, not a fact; see docs/calibration.md.
+CUT_REST_WORDS = 8
 MAX_REPORT = 20
 MAX_BYTES = 500_000
 
@@ -348,7 +352,7 @@ def js_comments(src: str, jsx: bool = True) -> list[Comment]:
     n = len(src)
     i = 0
     prev_sig = ""
-    # [kind, brace_depth]; only CODE frames use the depth.
+    # [kind, depth]: CODE counts braces, TAG counts type-argument brackets.
     frames: list[list] = [[_CODE, 0]]
 
     while i < n:
@@ -424,24 +428,8 @@ def js_comments(src: str, jsx: bool = True) -> list[Comment]:
             prev_sig = "/"
             continue
 
-        if kind == _TAG:
-            if c == "/" and src[i + 1 : i + 2] == ">":
-                frames.pop()  # self-closing: no children region
-                prev_sig = ")"
-                i += 2
-                continue
-            if c == ">":
-                frames[-1] = [_TEXT, 0]
-                i += 1
-                continue
-            if c in "'\"":
-                i = _js_string_end(src, i)
-                continue
-            i += 1
-            continue
-
-        # Everything below is reached only in a CODE frame, so the string,
-        # brace, element and regex cases need no kind test of their own.
+        # A tag's strings are prop values and the literal types in its type
+        # arguments, so a template type's `<` and `>` (`<Box<`<`>>`) are not its own.
         if c in "'\"`":
             end = _js_string_end(src, i)
             if c == "`" and end < n and src[end : end + 2] == "${":
@@ -450,8 +438,36 @@ def js_comments(src: str, jsx: bool = True) -> list[Comment]:
                 frames.append([_CODE, 0])
                 continue
             i = end
-            prev_sig = c
+            if kind == _CODE:
+                prev_sig = c
             continue
+
+        if kind == _TAG:
+            if c == "/" and src[i + 1 : i + 2] == ">":
+                frames.pop()  # self-closing: no children region
+                prev_sig = ")"
+                i += 2
+                continue
+            # `<Picker<Tag>`: type arguments, the only bare `<` a tag can hold.
+            # Their `>` is not the tag's, and a `=>` in a function type closes nothing.
+            if c == "<":
+                frames[-1][1] += 1
+                i += 1
+                continue
+            if c == ">" and frames[-1][1]:
+                if src[i - 1] != "=":
+                    frames[-1][1] -= 1
+                i += 1
+                continue
+            if c == ">":
+                frames[-1] = [_TEXT, 0]
+                i += 1
+                continue
+            i += 1
+            continue
+
+        # Everything below is reached only in a CODE frame, so the brace,
+        # element and regex cases need no kind test of their own.
         if c == "{":
             frames[-1][1] += 1
             prev_sig = c
@@ -614,7 +630,11 @@ HEREDOC = re.compile(r"<<-?\s*([\"']?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 # `# syntax=docker/dockerfile:1` -- the builder reads it, so it is the
 # Dockerfile spelling of the lint directives NEVER exempts everywhere else.
-DIRECTIVE = re.compile(r"^(syntax|escape|check)\s*=", re.I)
+DOCKER_DIRECTIVE = re.compile(r"^(syntax|escape|check)\s*=", re.I)
+# PEP 263's encoding declaration. Anchored, or `Encoding: base64` would read as one.
+CODING_COOKIE = re.compile(r"^(?:(?:-\*-|vim?:).*?)?coding[:=]\s*[-\w.]+")
+# What clippy's `undocumented_unsafe_blocks` looks for above an `unsafe` block.
+RUST_SAFETY = re.compile(r"^SAFETY:")
 
 
 def dockerfile_comments(src: str) -> list[Comment]:
@@ -649,7 +669,7 @@ def dockerfile_comments(src: str) -> list[Comment]:
                     lineno,
                     len(line) - len(head),
                     (body,),
-                    mergeable=not DIRECTIVE.match(body),
+                    mergeable=not DOCKER_DIRECTIVE.match(body),
                 )
             )
             continue
@@ -846,6 +866,82 @@ def rust_comments(src: str) -> list[Comment]:
     return out
 
 
+# A changelog does not number its entries, so `-`, `*` and `+` only.
+BULLET = re.compile(r"^( *)[-*+][ \t]+(.*)$")
+FENCE = re.compile(r"^ *(`{3,}|~{3,})")
+# Each of these ends the item above it rather than continuing it. The link
+# definition is the `[0.2.0]: https://...` table at the foot of the file.
+BLOCK_START = re.compile(r"^(?:#{1,6}(?:\s|$)|>|<!--|\[[^\]]+\]:\s)")
+# A thematic break ends the item too, and Markdown reads one before it reads a
+# list item, so `- - -` is a rule rather than an entry.
+RULE = re.compile(r"^([-*_])(?:[ \t]*\1){2,}$")
+
+
+def changelog_entries(src: str) -> list[Comment]:
+    """Every top-level list item of a Markdown changelog, one per entry.
+
+    An item keeps the lines Markdown gives it: a nested list or an indented
+    paragraph (after a blank line too), and an unindented line straight under it.
+    Headings, rules, the intro and the link table at the foot are not entries, and a
+    fence or an HTML comment holds examples of entries rather than entries.
+    """
+    out: list[Comment] = []
+    entry: list[str] = []
+    start = indent = blanks = 0
+    # The open fence's marker. Only its character, as many or more and nothing
+    # after them, closes it: `~~~example` inside is content.
+    fence = ""
+    html = False
+
+    def close() -> None:
+        if entry:
+            out.append(Comment(start, indent, tuple(entry), mergeable=False))
+            entry.clear()
+
+    for n, raw in enumerate(src.split("\n"), 1):
+        line = raw.rstrip()
+        text = line.lstrip()
+        col = len(line) - len(text)
+        if html:
+            html = "-->" not in line
+            continue
+        if fence:
+            m = FENCE.match(line)
+            closes = m and m.end() == len(line) and m[1][0] == fence[0]
+            if closes and len(m[1]) >= len(fence):
+                fence = ""
+            if entry:
+                entry.append(text)
+            continue
+        if not text:
+            blanks += bool(entry)
+            continue
+        rule = RULE.match(text)
+        item = None if rule else BULLET.match(line)
+        # One "" per blank line, so the span still reaches the paragraph below.
+        if entry and col > indent:
+            entry.extend([""] * blanks + [text])
+            fence = m[1] if (m := FENCE.match(line)) else ""
+            blanks = 0
+            continue
+        if entry and not (
+            blanks or item or rule or FENCE.match(line) or BLOCK_START.match(text)
+        ):
+            entry.append(text)
+            continue
+        close()
+        blanks = 0
+        if text.startswith("<!--"):
+            html = "-->" not in text[4:]
+        elif m := FENCE.match(line):
+            fence = m[1]
+        elif item:
+            start, indent = n, col
+            entry.append(item.group(2))
+    close()
+    return out
+
+
 # `uses: owner/repo@<sha>  # v6.2.0` -- the tag survives nowhere else on the
 # line, so the annotation is the convention rather than a label for it.
 SHA_PIN = re.compile(
@@ -875,6 +971,70 @@ def commented_out_config(lines: tuple[str, ...]) -> bool:
     return sum(1 for s in text if CONFIG_LINE.match(s)) >= max(1, len(text) // 2)
 
 
+DELETE, SHORTEN, REWRITE = "delete", "shorten", "rewrite"
+
+
+@dataclass(frozen=True)
+class Tier:
+    name: str
+    test: Callable[[Subject], bool]
+    # False where the signal is terseness, which is what a trailing annotation
+    # IS: `timeout = 5  # seconds` would fire 133 times here as `bare-identifier`.
+    inline_ok: bool = True
+    # What the author is asked to do when the tier objects to the whole comment.
+    action: str = DELETE
+    # For a tier objecting to part of one: body -> (the part, the rest). The
+    # finding then asks for deletion only if the rest is not worth keeping.
+    cut: Callable[[str], tuple[str, str]] | None = None
+
+
+# Flags 6 of PyBaMM's 266 entries over v24.1-v26.3.1; see docs/calibration.md.
+CHANGELOG_VERBOSE_WORDS = 40
+# PyBaMM's `([#123](https://github.com/owner/repo/pull/123))`, closing the entry;
+# GitLab writes `[!123](.../-/merge_requests/123)`. `\1` makes the number shown
+# the number linked, and an issue link is not a PR. A bare `(#123)` names the PR
+# with no URL, for a changelog published outside the private repo it would link.
+PR_TAIL = re.compile(
+    r"(?:\[[^\[\]]*[#!](\d+)\]\(https?://[^\s)]+/(?:pull|merge_requests)/\1/?\)"
+    r"|\([#!]\d+)\)\.?$"
+)
+LINK_TARGET = re.compile(r"\]\([^\s)]*\)")
+
+
+def entry_words(body: str) -> int:
+    """Words in a changelog entry, counting a link's text but not its URL."""
+    return len(RAW_WORD.findall(LINK_TARGET.sub("]", body)))
+
+
+# Length first: an entry usually wraps because it is long, and joining it onto
+# one line would not fix that.
+CHANGELOG_TIERS = (
+    Tier(
+        "verbose",
+        lambda s: entry_words(s.body) > CHANGELOG_VERBOSE_WORDS,
+        action=SHORTEN,
+    ),
+    Tier("multi-line", lambda s: prose_lines(s.lines) > 1, action=REWRITE),
+    Tier("pr-link", lambda s: not PR_TAIL.search(s.body), action=REWRITE),
+)
+
+CONVENTION = (
+    "Repo convention: comment the non-obvious why, not the what.\n"
+    "delete: nothing in it is worth keeping. shorten: keep its fact in fewer words,\n"
+    "without what `cut:` names. Or explain why a comment is load-bearing."
+)
+STRICT = "strict"
+STRICT_CONVENTION = (
+    "Strict mode: add no comments; Python docstrings and tool directives excepted.\n"
+    "A [strict] row is not explained away: delete it, or only what `cut:` names."
+)
+CHANGELOG_CONVENTION = (
+    f"Changelog convention: one line per entry, at most {CHANGELOG_VERBOSE_WORDS} "
+    "words, ending in its PR:\n"
+    "(#123) or ([#123](https://github.com/owner/repo/pull/123))"
+)
+
+
 @dataclass(frozen=True)
 class Lang:
     """Everything the engine knows about one language, in one record.
@@ -888,6 +1048,8 @@ class Lang:
     exts: frozenset[str]
     # Languages that name the file instead of suffixing it, like `Dockerfile`.
     stems: frozenset[str] = frozenset()
+    # Whole file names, where the suffix is shared: `.md` is every README too.
+    names: frozenset[str] = frozenset()
     # Tier names that never fire here.
     suppressed: frozenset[str] = frozenset()
     # Exempts a single comment outright: it fires nothing, merges with nothing,
@@ -899,12 +1061,17 @@ class Lang:
     # DENSITY_MAX is a percentile of a Python FUNCTION, while a script's scope
     # is its whole file.
     density_max: float = DENSITY_MAX
+    # Replaces TIERS where the units are not code comments, and with it NEVER,
+    # the unreviewed tier, the model sweep and the density ratio.
+    tiers: tuple[Tier, ...] = ()
+    # What the report asks of the author.
+    convention: str = CONVENTION
 
 
 LANGUAGES = {
     lang.name: lang
     for lang in (
-        Lang("python", py_comments, frozenset({".py", ".pyi"})),
+        Lang("python", py_comments, frozenset({".py", ".pyi"}), veto=CODING_COOKIE),
         # Every file where JSX is legal. Babel allows it in `.js`.
         Lang("jsx", js_comments, frozenset({".js", ".jsx", ".mjs", ".cjs", ".tsx"})),
         # TypeScript forbids JSX in `.ts` so that `<Foo>x` can stay a type
@@ -924,13 +1091,13 @@ LANGUAGES = {
             suppressed=frozenset({"bare-identifier"}),
             block_veto=commented_out_config,
         ),
-        Lang("rust", rust_comments, frozenset({".rs"})),
+        Lang("rust", rust_comments, frozenset({".rs"}), veto=RUST_SAFETY),
         Lang(
             "dockerfile",
             dockerfile_comments,
             frozenset({".dockerfile", ".containerfile"}),
             stems=frozenset({"dockerfile", "containerfile"}),
-            veto=DIRECTIVE,
+            veto=DOCKER_DIRECTIVE,
         ),
         # Extensions only: `language_of` reads a path, not the source, so a
         # shebang is invisible to it.
@@ -941,10 +1108,19 @@ LANGUAGES = {
             # Whole-script p95 is 38.5% (vcpkg); see docs/calibration.md.
             density_max=0.40,
         ),
+        Lang(
+            "changelog",
+            changelog_entries,
+            frozenset(),
+            names=frozenset({"changelog.md"}),
+            tiers=CHANGELOG_TIERS,
+            convention=CHANGELOG_CONVENTION,
+        ),
     )
 }
 _BY_EXT = {ext: lang for lang in LANGUAGES.values() for ext in lang.exts}
 _BY_STEM = {stem: lang for lang in LANGUAGES.values() for stem in lang.stems}
+_BY_NAME = {name: lang for lang in LANGUAGES.values() for name in lang.names}
 
 
 def language_of(path: str) -> Lang | None:
@@ -954,11 +1130,15 @@ def language_of(path: str) -> Lang | None:
     `Dockerfile.prod` and `Containerfile` all have a suffix `os.path.splitext`
     either cannot see or reads as the variant. A real supported extension still
     wins, so `Dockerfile.py` stays Python rather than losing every docstring.
+
+    A changelog is matched on its whole name, `CHANGELOG.md`: its suffix is every
+    README's, and its stem is also Debian's `debian/changelog`, a different format.
     """
     ext = os.path.splitext(path)[1].lower()
     if ext in _BY_EXT:
         return _BY_EXT[ext]
-    return _BY_STEM.get(os.path.basename(path).lower().split(".", 1)[0])
+    base = os.path.basename(path).lower()
+    return _BY_NAME.get(base) or _BY_STEM.get(base.split(".", 1)[0])
 
 
 def extract(src: str, path: str) -> list[Comment]:
@@ -993,20 +1173,29 @@ def extract(src: str, path: str) -> list[Comment]:
     ]
 
 
-# NEVER is case-insensitive except the issue key: folded, `us-east-1` would read
-# as one, and `(?<![\w-])` stops `US-EAST-1` matching through its `EAST-1` tail.
-NEVER = re.compile(
-    r"""
+# `fmt:` names its values because a bare `fmt:` matches Rust's `fmt::Display`.
+# A TypeScript `/// <reference>` reaches here as `/ <reference`, its `//` lexed off.
+DIRECTIVES = r"""
     noqa | type:\s*ignore | pylint: | pyright: | mypy: | ruff: | flake8:
   | eslint- | prettier-ignore | biome-ignore | @ts- | c8\s+ignore | istanbul\s+ignore
-  | pragma | fmt:\s*(on|off) | yapf: | isort: | shellcheck
+  | pragma | fmt:\s*(on|off|skip) | yapf: | isort: | shellcheck | nosec\b
+  | @(vitest|jest)-environment\b | /\s*<reference\b
+  | hadolint\s+(global\s+)?(ignore|shell)\s*= | yamllint\s+(disable|enable)
+  | yaml-language-server:
+"""
+# NEVER is case-insensitive except the issue key: folded, `us-east-1` would read
+# as one, and `(?<![\w-])` stops `US-EAST-1` matching through its `EAST-1` tail.
+# `UTF-8` and `SHA-256` have the key's shape but name an encoding and a hash.
+NEVER = re.compile(
+    DIRECTIVES
+    + r"""
   # Uppercase only, like the ticket-ID alternative below. These are ordinary
   # English words too, and case-insensitively `a real lexer bug sat here` would
   # read as a `BUG:` marker, and a veto is a miss no tier can report.
   | (?-i:\bTODO\b | \bFIXME\b | \bHACK\b | \bXXX\b | \bBUG\b | \bWARNING\b
   | \bSAFETY\b | \bSECURITY\b | \bNOTE\b | \bIMPORTANT\b | \bCAUTION\b)
   | copyright | spdx-license | @license | @preserve | @flow | \beslint\b
-  | https?:// | (?-i:(?<![\w-])[A-Z][A-Z0-9]+-\d+\b) | \bRFC\s?\d+ | \#\d+
+  | https?:// | (?-i:(?<![\w-])(?!(?:UTF|SHA)-)[A-Z][A-Z0-9]+-\d+\b) | \bRFC\s?\d+ | \#\d+\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -1061,16 +1250,29 @@ STOPWORDS = {
 #
 # Completed-edit forms only: an imperative is how a docstring summary reads, so
 # `updated?`/`drop(ped)?` would cost 2 of the corpus's 6 false positives.
-EDIT_NARRATION = re.compile(
-    r"^\(?\s*(added|adding|updated|fixe[ds]|changed|modified|"
-    r"removed|renamed|refactor(ed|ing)|rework(ed|ing)|tweak(ed|ing)|"
-    r"adjust(ed|ing)|simplified|clean(ed) up|dropped|switched|"
-    r"moved|inlined|extracted|renaming|reverted|"
-    r"was|previously|instead of)\b"
-    r"|^\(?\s*(fix|new|add|update|change|remove|drop|move|split|"
-    r"refactor|rework|revert)\s*:",
+EDIT_VERBS = (
+    r"added|adding|updated|fixe[ds]|changed|modified|"
+    r"removed|renamed|refactor(?:ed|ing)|rework(?:ed|ing)|tweak(?:ed|ing)|"
+    r"adjust(?:ed|ing)|simplified|cleaned up|dropped|switched|"
+    r"moved|inlined|extracted|renaming|reverted"
+)
+# Spares a history adverb dating runtime order (`-computed`, `returned by`) or an
+# input: a data verb over a bare noun, not over `the`, as in "a measured OCV".
+NOT_HISTORY = (
+    r"(?!-\w+ed\b)(?!\s+\w+ed\s+(?:by|using|with|from)\b)"
+    r"(?!\s+(?:measured|fitted|saved|evaluated|calculated|computed|seriali[sz]ed"
+    r"|installed|uploaded|labell?ed|recorded|sampled)\b"
+    r"(?!\s+(?:the|a|an|that|this|these|those|it|them)\b))"
+)
+EDIT_PAST = re.compile(
+    rf"^\(?\s*(?:{EDIT_VERBS}|was|previously\b{NOT_HISTORY}|instead of)\b", re.I
+)
+EDIT_LABEL = re.compile(
+    r"^\(?\s*(?:fix(?:ed)?|new|add(?:ed)?|updated?|changed?|removed?|drop(?:ped)?"
+    r"|moved?|split|refactor(?:ed)?|rework(?:ed)?|revert(?:ed)?)\s*:\s*",
     re.I,
 )
+EDIT_NARRATION = re.compile(rf"{EDIT_PAST.pattern}|{EDIT_LABEL.pattern}", re.I)
 BANNER = re.compile(
     r"^[=\-*~_#\s]{3,}$"  # pure divider
     # Labels carry hyphens and dots, which a \w-only class would miss. 120 bounds
@@ -1106,6 +1308,10 @@ class Finding:
     line: int
     reason: str
     text: str
+    # `DELETE`, `SHORTEN` or `REWRITE`: what the author is asked to do.
+    action: str
+    # The part to remove, where the tier objected to part of a comment worth keeping.
+    cut: str = ""
 
 
 def words(text: str) -> set[str]:
@@ -1120,12 +1326,108 @@ def words(text: str) -> set[str]:
     return out
 
 
+# The code under a heading is one thing when it opens with a definition or a
+# compound statement's header, and the heading then names that one thing.
+DEFINITION = re.compile(
+    r"^@|^(?:export\s+)?(?:default\s+)?(?:pub(?:\([\w:]+\))?\s+)?(?:async\s+)?"
+    r"(?P<keyword>def|class|function|fn|impl|struct|enum|trait|interface|type|mod)"
+    # Not a field or a variable that has the keyword's name: `type: 'email'`.
+    r"\b(?!\s*[:=,;)\]}])|^[A-Za-z_][\w-]*\s*\(\)\s*\{"
+)
+# The kinds a definition's own keyword says it is: `Cleanup function` over
+# `cleanup() {` restates the name, but `enum` over a `def` says something new.
+ROLE_NOUNS = frozenset(
+    {"helper", "handler", "callback", "component", "hook", "fixture"}
+)
+FUNCTION_NOUNS = ROLE_NOUNS | {"function", "func", "method"}
+CLASS_NOUNS = ROLE_NOUNS | {"class", "type"}
+KIND_NOUNS = {
+    "def": FUNCTION_NOUNS,
+    "function": FUNCTION_NOUNS,
+    "fn": FUNCTION_NOUNS,
+    "class": CLASS_NOUNS,
+    **{k: frozenset({k, "type"}) for k in ("struct", "enum", "trait", "interface")},
+    "type": frozenset({"type"}),
+}
+
+
+def kind_nouns(code_line: str) -> frozenset[str]:
+    """The nouns naming what the definition on `code_line` is, if it opens one."""
+    m = DEFINITION.match(code_line)
+    if m is None:
+        return frozenset()
+    if m["keyword"]:
+        return KIND_NOUNS.get(m["keyword"], frozenset())
+    # A decorator sits on a function or a class, and `name() {` is a shell function.
+    return FUNCTION_NOUNS | CLASS_NOUNS if code_line.startswith("@") else FUNCTION_NOUNS
+
+
 def restates(comment: str, code_line: str) -> bool:
-    cw = words(comment)
+    cw = words(comment) - kind_nouns(code_line.strip())
     if not cw or len(cw) > 8:
         return False
     code = re.sub(r"""(["'`]).*?\1""", " ", code_line)
     return cw <= words(code)
+
+
+STRING_LITERAL = re.compile(r"""(["'`])(?:\\.|(?!\1).)*\1""")
+# A line ending here carries its statement onto the next one. Not a comma: at the
+# top level one separates sibling fields, arms or arguments.
+CONTINUED = re.compile(r"(?:[([{=+\-*/\\.:|&]|\band|\bor)\s*$")
+# A line opening this way continues the one above: a closing bracket, a method
+# chain, or a ternary or boolean operator a formatter moved down. Not a `::` path.
+LEADING_CONTINUATION = re.compile(r"^(?:[)\]}.?]|:(?!:)|&&|\|\|)")
+# A shell compound statement's header, which ends in neither `:` nor `{`.
+COMPOUND = re.compile(r"^(?:if|for|while|until|case|select)\s+(?![=:])")
+# Where the scope a heading sits in ends: the next definition, or the next clause
+# of the compound statement it sits inside.
+SCOPE_END = re.compile(r"^(?:elif|else|except|finally|case|default)\b|^[)\]}]")
+# A binding, a field or an assignment: a statement that names something.
+DECLARATION = re.compile(
+    r"^(?:(?:export|pub(?:\([\w:]+\))?|const|let|var|val|mut|static|readonly"
+    r"|private|protected|public)\s+)*"
+    r"(?:\[[\w\s,]*\]|\{[\w\s,]*\}|[A-Za-z_][\w.]*)\s*(?::(?!:)|=(?![=>]))"
+)
+# A `{` where only a value can go, as in `x = {`, so it opens no body. Not `({`,
+# which can open an arrow function's destructured parameters.
+LITERAL_OPEN = re.compile(r"(?:[=:\[,]|\breturn)\s*\{$")
+
+
+def statements(code: tuple[str, ...]) -> list[str]:
+    """The statements starting at the top level of `code`, strings blanked.
+
+    Bracket depth decides what a line continues. A block opened by a bare `{` is
+    read inside, where its statements are; a definition or a compound header is
+    one statement, whatever follows it. The count stops where the heading's scope
+    does, so a test function below its last line is not one of its statements.
+    """
+    lines = [STRING_LITERAL.sub('""', c.strip()) for c in code if c.strip()]
+    if not lines:
+        return []
+    first = lines[0]
+    if first != "{" and (
+        DEFINITION.match(first)
+        or COMPOUND.match(first)
+        or first.endswith(":")
+        or (first.endswith("{") and not LITERAL_OPEN.search(first))
+    ):
+        return [first]
+    level = 1 if first == "{" else 0
+    out: list[str] = []
+    depth, prev = level, ""
+    for line in lines[level:]:
+        opens = depth == level and not CONTINUED.search(prev)
+        if opens and out and (DEFINITION.match(line) or SCOPE_END.match(line)):
+            break
+        if opens and not LEADING_CONTINUATION.match(line):
+            out.append(line)
+        elif out:
+            out[-1] += " " + line
+        depth += sum(map(line.count, "([{")) - sum(map(line.count, ")]}"))
+        if depth < level:
+            break
+        prev = line
+    return out
 
 
 DELIM = re.compile(r"^[=\-*~_#\s]+$")
@@ -1150,13 +1452,24 @@ CODE_REF = re.compile(
     re.I,
 )
 
-# Plan/process vocabulary belongs in the PR, not in the source.
+# Plan/process vocabulary belongs in the PR, not in the source. The tier reads
+# it through `unquoted`, so a step name quoted from a protocol is data.
 PROCESS_LEAK = re.compile(
     r"\b(task|step|phase|stage|milestone|chunk|part)\s*\d+\b"
     r"|\bper the (plan|spec|design)\b|\bas (planned|specced|designed)\b"
     r"|\bin this (PR|patch|commit|change)\b|\bPR\s*#?\d+",
     re.I,
 )
+QUOTED = re.compile(r'"[^"]*"')
+
+
+def unquoted(body: str) -> str:
+    """`body` with the text inside each `"..."` pair blanked, at the same offsets.
+
+    Pairs close left to right, so the lone `"` of `a 3" pipe` quotes nothing.
+    """
+    return QUOTED.sub(lambda m: '"' + " " * (len(m[0]) - 2) + '"', body)
+
 
 # A snapshot is true of one machine on one day, and nothing re-checks it. The
 # unit discriminates, not the digit -- see docs/calibration.md.
@@ -1204,12 +1517,16 @@ def benchmark(body: str) -> bool:
 # lookaheads are measured, not stylistic -- see docs/calibration.md.
 HISTORICAL = re.compile(
     r"\b(this|that|it|they|them|these|those|we)\s+used\s+to\b"
-    r"|\b(previously|originally|historically|formerly)\b"
-    r"(?!-\w+ed\b)(?!\s+\w+ed\s+(?:by|using|with|from)\b)"
+    rf"|\b(previously|originally|historically|formerly)\b{NOT_HISTORY}"
+    # A subject before the adverb makes a participle NOT_HISTORY spares its verb.
+    # Mid-sentence, `this` and `that` are determiners instead.
+    r"|(?:\b(?:it|they|we)|(?:^|[.!?;:]\s+)(?:this|that))\s+"
+    r"(?:previously|originally|historically|formerly)\s+\w+ed\b"
     r"|\bbefore the (fix|change|refactor)\b|\bin the old\b"
     r"|\b(was|were)\s+(found|introduced|added|broken|fixed|changed|removed)\b"
     r"|\bregression (from|introduced)\b|\bas of\s+\d"
-    r"|\b(19|20)\d{2}-\d{2}(-\d{2})?\b",
+    # A date inside a timestamp, a path or a dotted value is a format example.
+    r"|(?<![/.\w])(19|20)\d{2}-\d{2}(-\d{2})?(?![\w-]|\s\d{1,2}:\d{2})",
     re.I,
 )
 
@@ -1269,6 +1586,25 @@ def prose_lines(lines: tuple[str, ...]) -> int:
     JSDoc block, and report a two-word comment as verbose.
     """
     return sum(1 for s in lines if s.strip())
+
+
+# A run of delimiters is a banner's, whose title is decoration rather than content.
+DELIM_RUN = re.compile(r"[=\-*~_#]{3}")
+
+
+def formula_row(line: str) -> bool:
+    """Whether a line is a formula, matrix or table row: two-thirds symbols, or
+    cells between bars. A line of prose naming code identifiers is not either."""
+    text = "".join(line.split())
+    if DELIM_RUN.search(text):
+        return False
+    table = text.startswith("|") and text.endswith("|") and len(text) > 1
+    return table or 3 * sum(c.isalpha() for c in text) < len(text)
+
+
+def prose_rows(lines: tuple[str, ...]) -> tuple[str, ...]:
+    """The lines that spend a comment's prose length budget."""
+    return tuple(line for line in lines if line.strip() and not formula_row(line))
 
 
 # A parenthetical, example or unit states what the code does not, so it is not
@@ -1406,11 +1742,53 @@ def vetoed(body: str, lang: str = "") -> bool:
     The one copy of the per-comment exemption set: `exempt`, `group_blocks`,
     `density_sets` and `recalibrate.measure` all ask it, so a new `NEVER`
     alternative reaches every one of them at once.
+
+    A language with its own `tiers` is exempt only when empty. NEVER would spare
+    every changelog entry, since each ends in the URL and `#123` it requires.
     """
+    rec = LANGUAGES.get(lang)
+    if rec is not None and rec.tiers:
+        return not body
     if not body or body.startswith(":") or NEVER.search(body):
         return True
-    veto = LANGUAGES[lang].veto if lang in LANGUAGES else None
-    return bool(veto and veto.match(body))
+    return bool(rec and rec.veto and rec.veto.match(body))
+
+
+SENTENCE_END = re.compile(r"[.!?][\"')\]]*$")
+# A tool directive is not prose, so no sentence runs into or out of one.
+DIRECTIVE = re.compile(rf"^(?:{DIRECTIVES})", re.IGNORECASE | re.VERBOSE)
+# Not a `fixed:` label or commented-out `key = 1`. A Sphinx role counts because
+# wrapped to the start of a line it reads as an exempt `#:` comment.
+MID_SENTENCE = re.compile(
+    r"^(?![a-z][\w-]*:\s)(?:[a-z][\w'-]*[,;]?\s+[\w`(\"']|https?://|\(|:[a-z]+:`)"
+)
+EDITED = re.compile(rf"^\(?\s*(?:{EDIT_VERBS})\b", re.I)
+AWAITS_VERB = re.compile(
+    r"\b(?:(?:is|are|was|were|be|been|being|has|have|had|gets?|got)"
+    r"(?:\s+(?:not|never|always|also|still|just|\w+ly))?"
+    r"|it|they|we|this|that|which|who|and|or|but)$"
+)
+
+
+def continues(above: str, below: str) -> bool:
+    """Whether `below` picks up a sentence `above` left unfinished.
+
+    A blank `#` line is a paragraph break, which nothing continues. Neither does
+    a line opening with a completed edit, `fixed the cache logic` under a `TODO`
+    with no period: read as that marker's predicate, it would be exempt with it.
+    The verb continues only after an auxiliary or a subject pronoun, as in `the
+    buffer is` over `moved into the closure`, an auxiliary and its adverb (`is
+    never`), or a coordinator joining it to an earlier verb (`hashed, salted and`).
+    """
+    above = above.rstrip()
+    return (
+        bool(above)
+        and not SENTENCE_END.search(above)
+        and not DIRECTIVE.match(above)
+        and not DIRECTIVE.match(below)
+        and bool(MID_SENTENCE.match(below))
+        and not (EDITED.match(below) and not AWAITS_VERB.search(above))
+    )
 
 
 def group_blocks(raw: list[Comment]) -> list[Comment]:
@@ -1434,7 +1812,9 @@ def group_blocks(raw: list[Comment]) -> list[Comment]:
     above `# Fixed: use the cache` would produce no finding at all, and so would
     a URL, a `NOTE`, or a lint directive. Asking `vetoed` of each line keeps an
     exemption to the comment it matches, as `dockerfile_comments` does for a
-    `# syntax=` directive above a build's opening explanation.
+    `# syntax=` directive above a build's opening explanation. The exception is a
+    sentence that runs through the exempt line (`continues`): that is one
+    comment, and split, its tail is judged alone from mid-sentence.
 
     PLAIN only, because there the merge is OUR choice: a run of `#` lines is a
     run of separate comments we decide to read as one paragraph. A `///` run is
@@ -1458,6 +1838,7 @@ def group_blocks(raw: list[Comment]) -> list[Comment]:
             and not (
                 c.kind == PLAIN
                 and (vetoed(c.body, c.lang) or vetoed(prev.body, prev.lang))
+                and not continues(prev.body, c.body)
             )
             and not c.inline
             and not prev.inline
@@ -1484,59 +1865,165 @@ class Subject:
     body: str
     # The code sharing the comment's line, else the first line below it.
     target: str = ""
+    # The first code lines below the block, as `block_context` reads them.
+    code: tuple[str, ...] = ()
 
 
-def subject(b: Comment, target: str = "") -> Subject:
+def subject(b: Comment, target: str = "", code: tuple[str, ...] = ()) -> Subject:
     judged = classified_lines(b)
-    return Subject(b, judged, _joined(judged), target)
+    return Subject(b, judged, _joined(judged), target, tuple(code))
 
 
 def verbose(s: Subject) -> bool:
     word_limit, line_limit = verbose_limits(s.block.kind)
+    prose = prose_rows(s.lines)
     return (
-        len(RAW_WORD.findall(s.body)) > word_limit or prose_lines(s.lines) >= line_limit
+        len(RAW_WORD.findall(" ".join(prose))) > word_limit or len(prose) >= line_limit
     )
 
 
-@dataclass(frozen=True)
-class Tier:
-    name: str
-    test: Callable[[Subject], bool]
-    # False where the signal is terseness, which is what a trailing annotation
-    # IS: `timeout = 5  # seconds` would fire 133 times here as `bare-identifier`.
-    inline_ok: bool = True
+def heads_group(s: Subject) -> bool:
+    """Whether a heading names the statements below it rather than one of them.
+
+    `State` over six fields names them, and appears in none. A label whose words
+    do appear there repeats them, as `button` over `closeButton:` and its siblings,
+    or `Imports` over `import` lines: a plural `s` does not make the word new.
+    """
+    found = statements(s.code)
+    said = singular(words(s.body))
+    return len(found) >= 2 and not any(said & singular(words(st)) for st in found)
 
 
-def _matches(rx: re.Pattern[str]) -> Callable[[Subject], bool]:
-    return lambda s: bool(rx.search(s.body))
+def singular(ws: set[str]) -> set[str]:
+    """`ws` with a plural `s` dropped, on both sides of a comparison."""
+    return {w[:-1] if len(w) > 3 and w[-1] == "s" and w[-2] != "s" else w for w in ws}
 
+
+def heads_siblings(s: Subject) -> bool:
+    """Whether a heading restating its first line restates a sibling declaration too.
+
+    Then its words are the declarations' shared prefix, and it heads them: `Step
+    condition state` over each `stepCondition... = useState()`. A call declares
+    nothing, so `Clear cache` over `clear_cache()` and an `assert` on the cache is
+    still about the call.
+    """
+    said = words(s.body)
+    found = [st for st in statements(s.code) if DECLARATION.match(st)]
+    return sum(said <= words(st) for st in found) >= 2
+
+
+def _matches(
+    rx: re.Pattern[str], mask: Callable[[str], str] | None = None
+) -> Callable[[Subject], bool]:
+    return lambda s: bool(rx.search(mask(s.body) if mask else s.body))
+
+
+def _heading(rx: re.Pattern[str]) -> Callable[[Subject], bool]:
+    return lambda s: bool(rx.search(s.body)) and not heads_group(s)
+
+
+# A sentence, or a part of one set off by `;` or a dash. A sentence break needs
+# a capital after it, so `e.g. the` stays whole.
+CLAUSE_BREAK = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z(`\"'])|;\s+|\s+(?:--|\u2014|\u2013)\s+"
+)
+LEADING_PUNCT = re.compile(r"^[\s:;,.)\u2014\u2013-]+")
+
+
+def drop_clauses(rx: re.Pattern[str]) -> Callable[[str], tuple[str, str]]:
+    """A `Tier.cut` taking out every clause `rx` matches in."""
+
+    def cut(body: str) -> tuple[str, str]:
+        hit, rest = [], []
+        for p in CLAUSE_BREAK.split(body):
+            if p.strip():
+                (hit if rx.search(p) else rest).append(p)
+        if not hit:
+            # The match spans a break, so no one clause is the part to cut.
+            return body, ""
+        return " \u2026 ".join(hit), " ".join(rest)
+
+    return cut
+
+
+def drop_matches(
+    rx: re.Pattern[str], mask: Callable[[str], str] | None = None
+) -> Callable[[str], tuple[str, str]]:
+    """A `Tier.cut` taking out each match of `rx` and leaving its sentence.
+
+    With a `mask`, `rx` searches `mask(body)`, which hides text without moving
+    it, so each match's offsets still cut it from `body`.
+    """
+
+    def cut(body: str) -> tuple[str, str]:
+        spans = [m.span() for m in rx.finditer(mask(body) if mask else body)]
+        found = " \u2026 ".join(body[a:b].strip() for a, b in spans)
+        rest = body
+        for a, b in reversed(spans):
+            rest = f"{rest[:a]} {rest[b:]}"
+        return found, LEADING_PUNCT.sub("", " ".join(rest.split()))
+
+    return cut
+
+
+def cut_edit(body: str) -> tuple[str, str]:
+    """A `Fix:` label goes alone; a past-tense edit takes its sentence with it."""
+    label = EDIT_LABEL.match(body)
+    if label:
+        return label.group(0).strip(), body[label.end() :].strip()
+    return drop_clauses(EDIT_PAST)(body)
+
+
+# Each with the punctuation setting it off, so a numbered label leaves its text.
+STEP_LABEL = re.compile(
+    r"^(?:(?:step|test|case|part|phase)\s*\d+\b|\d+[.)])\s*[:.)-]?", re.I
+)
+OPENER = re.compile(rf"(?:{NARRATIVE.pattern}),?", re.I)
+EMOJI_CUT = re.compile(f"{EMOJI.pattern}\ufe0f?")
 
 # The cascade, in order: the first tier to fire names the finding.
 TIERS = (
     Tier(
         "restates-code",
-        lambda s: bool(s.target) and restates(s.body, s.target),
+        lambda s: (
+            bool(s.target) and restates(s.body, s.target) and not heads_siblings(s)
+        ),
         inline_ok=False,
     ),
-    Tier("edit-narration", _matches(EDIT_NARRATION)),
+    Tier("edit-narration", _matches(EDIT_NARRATION), cut=cut_edit),
     Tier("banner", _matches(BANNER)),
-    Tier("section-label", _matches(SECTION_LABEL), inline_ok=False),
-    Tier("bare-identifier", _matches(BARE_IDENTIFIER), inline_ok=False),
-    Tier("emoji", _matches(EMOJI)),
-    Tier("narrative", _matches(NARRATIVE), inline_ok=False),
-    Tier("step-marker", _matches(STEP_MARKER)),
-    Tier("meta", _matches(META)),
-    Tier("code-reference", _matches(CODE_REF)),
-    Tier("process-leak", _matches(PROCESS_LEAK), inline_ok=False),
-    Tier("benchmark", lambda s: benchmark(s.body)),
-    Tier("historical", _matches(HISTORICAL), inline_ok=False),
-    Tier("unbuilt", lambda s: unbuilt(s.body), inline_ok=False),
+    Tier("section-label", _heading(SECTION_LABEL), inline_ok=False),
+    Tier("bare-identifier", _heading(BARE_IDENTIFIER), inline_ok=False),
+    Tier("emoji", _matches(EMOJI), cut=drop_matches(EMOJI_CUT)),
+    Tier("narrative", _matches(NARRATIVE), inline_ok=False, cut=drop_matches(OPENER)),
+    Tier("step-marker", _matches(STEP_MARKER), cut=drop_matches(STEP_LABEL)),
+    Tier("meta", _matches(META), cut=drop_matches(META)),
+    Tier("code-reference", _matches(CODE_REF), cut=drop_matches(CODE_REF)),
+    Tier(
+        "process-leak",
+        _matches(PROCESS_LEAK, unquoted),
+        inline_ok=False,
+        cut=drop_matches(PROCESS_LEAK, unquoted),
+    ),
+    Tier("benchmark", lambda s: benchmark(s.body), cut=drop_clauses(BENCHMARK)),
+    Tier(
+        "historical",
+        _matches(HISTORICAL),
+        inline_ok=False,
+        cut=drop_clauses(HISTORICAL),
+    ),
+    Tier(
+        "unbuilt",
+        lambda s: unbuilt(s.body),
+        inline_ok=False,
+        cut=drop_clauses(UNBUILT),
+    ),
     Tier(
         "conditional-narration",
         lambda s: conditional_narration(s.body),
         inline_ok=False,
     ),
-    Tier("verbose", verbose),
+    Tier("verbose", verbose, action=SHORTEN),
 )
 # Every short comment the cascade let through. High recall and low precision,
 # so only a deliberate sweep asks for it, and last so it never outranks a tier.
@@ -1551,19 +2038,83 @@ def exempt(s: Subject) -> bool:
     )
 
 
-def fires(s: Subject, unreviewed: bool = False) -> str | None:
+def first_tier(s: Subject, unreviewed: bool = False) -> Tier | None:
     """The first tier to fire on a block `exempt` let through, if any."""
     lang = LANGUAGES.get(s.block.lang)
     suppressed = lang.suppressed if lang else frozenset()
-    for tier in (*TIERS, UNREVIEWED) if unreviewed else TIERS:
+    if lang is not None and lang.tiers:
+        cascade = lang.tiers
+    else:
+        cascade = (*TIERS, UNREVIEWED) if unreviewed else TIERS
+    for tier in cascade:
         if tier.name in suppressed or (s.block.inline and not tier.inline_ok):
             continue
         if tier.test(s):
-            return tier.name
+            return tier
     return None
 
 
-def block_reason(b: Comment, target: str = "", unreviewed: bool = False) -> str | None:
+def fires(s: Subject, unreviewed: bool = False) -> str | None:
+    """The name of the first tier to fire on a block `exempt` let through."""
+    tier = first_tier(s, unreviewed)
+    return tier.name if tier else None
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """The tier that fired on a block, and the fix it asks for."""
+
+    reason: str
+    action: str
+    cut: str = ""
+
+
+def verdict(s: Subject, unreviewed: bool = False) -> Verdict | None:
+    """The first tier to fire on a block `exempt` let through, and its fix.
+
+    The tiers read a docstring's prose only, so where its `Parameters`, `Returns`
+    or other prescribed sections follow, deleting it would take them unread. The
+    finding then asks for the prose alone to be cut.
+    """
+    v = prose_verdict(s, unreviewed)
+    if (
+        v
+        and v.action == DELETE
+        and s.block.kind == DOC
+        and _joined(s.block.lines) != s.body
+    ):
+        return Verdict(v.reason, SHORTEN, s.body)
+    return v
+
+
+def prose_verdict(s: Subject, unreviewed: bool = False) -> Verdict | None:
+    """`verdict` over the text the tiers read, whatever else the block holds.
+
+    A tier with a `cut` objects to part of the comment. If the rest is longer than
+    `CUT_REST_WORDS` and, judged alone, would not be deleted, the finding cuts that
+    part and whatever the rest's own verdict cuts. Otherwise the whole comment
+    goes, as `Detect connected components` does under a step number.
+
+    A doc block's rest needs only a word: there it is the summary line.
+    """
+    tier = first_tier(s, unreviewed)
+    if tier is None:
+        return None
+    if tier.cut is None:
+        return Verdict(tier.name, tier.action)
+    part, rest = tier.cut(s.body)
+    floor = 0 if s.block.kind == DOC else CUT_REST_WORDS
+    if part and len(words(rest)) > floor:
+        left = prose_verdict(Subject(s.block, (rest,), rest, s.target, s.code))
+        if left is None or left.action == SHORTEN:
+            cut = f"{part} \u2026 {left.cut}" if left and left.cut else part
+            return Verdict(tier.name, SHORTEN, cut)
+    return Verdict(tier.name, DELETE)
+
+
+def block_reason(
+    b: Comment, target: str = "", unreviewed: bool = False, code: tuple[str, ...] = ()
+) -> str | None:
     """Which tier fires on this block, if any: `exempt`, then `fires`.
 
     For callers that judge a block outside `analyze`'s walk -- corpus
@@ -1571,20 +2122,95 @@ def block_reason(b: Comment, target: str = "", unreviewed: bool = False) -> str 
     the same two functions the walk does, so a measurement and the hook agree
     about what fires.
     """
-    s = subject(b, target)
+    s = subject(b, target, code)
     return None if exempt(s) else fires(s, unreviewed)
 
 
-def block_context(lines: list[str], b: Comment, n: int) -> list[str]:
-    """The first `n` non-blank code lines after the block's LAST line."""
+def block_verdict(
+    b: Comment, target: str = "", unreviewed: bool = False, code: tuple[str, ...] = ()
+) -> Verdict | None:
+    """`block_reason` with the fix, for scoring what a finding asks of the author."""
+    s = subject(b, target, code)
+    return None if exempt(s) else verdict(s, unreviewed)
+
+
+def heading_starts(raw: list[Comment], lines: list[str]) -> dict[int, int]:
+    """The line each comment that could head code starts on, mapped to its column.
+
+    Own-line plain comments only: a doc comment, a `#:` field note or a directive
+    belongs to the line below it, so it does not end the group that line is in.
+    The lexer strips `#:` like any marker, so `lines` is read for it.
+    """
+    return {
+        c.line: c.col
+        for c in raw
+        if c.kind == PLAIN
+        and not c.inline
+        and not vetoed(c.body, c.lang)
+        and not lines[c.line - 1].startswith("#:", c.col)
+    }
+
+
+# The furthest a context read `by_statement` goes, so a bracket the scan never
+# sees close cannot carry it to the end of the file.
+CONTEXT_MAX_LINES = 40
+
+
+def block_context(
+    lines: list[str],
+    b: Comment,
+    n: int,
+    headings: Mapping[int, int] | None = None,
+    *,
+    by_statement: bool = False,
+) -> list[str]:
+    """The first `n` code lines after the block, within its scope.
+
+    `headings` is `heading_starts` of the file. Once the code has begun, the next
+    comment at the block's column or left of it heads what follows, so `Setup`
+    over one call is not read as heading the calls under a `Run` below it.
+
+    `by_statement` counts only lines that start outside a bracket, so a heading
+    sees past a first statement written over several lines to those beside it.
+    """
     after = b.line + b.span - 1
     out = []
-    for line in lines[after : after + n + 2]:
+    # `statements()` sees stripped lines, so a Python dedent is caught here,
+    # before a module-level line joins an in-function statement's group.
+    scope_indent = b.col if b.lang == "python" and not b.inline else None
+    bracket_depth = 0
+    # Two lines more than `n`, for blank lines; a line inside a bracket is free.
+    budget = n + 2
+    starts = 0
+    span = CONTEXT_MAX_LINES if by_statement else budget
+    for number, line in enumerate(lines[after : after + span], after + 1):
+        inside = by_statement and bracket_depth > 0
+        if not inside:
+            if budget == 0:
+                break
+            budget -= 1
+        col = headings.get(number) if headings else None
+        if out and col is not None and col <= b.col:
+            break
         text = line.strip()
         if text and not text.startswith(CONT_PREFIX):
-            out.append(text)
-            if len(out) == n:
+            indent = len(line) - len(line.lstrip())
+            if (
+                scope_indent is not None
+                and indent < scope_indent
+                and bracket_depth == 0
+            ):
                 break
+            if not inside:
+                if starts == n:
+                    break
+                starts += 1
+            out.append(text)
+            if scope_indent is not None or by_statement:
+                code = STRING_LITERAL.sub('""', text)
+                bracket_depth += sum(map(code.count, "([{")) - sum(
+                    map(code.count, ")]}")
+                )
     return out
 
 
@@ -1646,6 +2272,8 @@ def density_finding(
     comment-sparse; counting it as comment would flag it for being documented.
     """
     lang = language_of(path)
+    if lang is not None and lang.tiers:
+        return None
     ceiling = lang.density_max if lang else DENSITY_MAX
     lines = src.split("\n")
     scope = added if added is not None else set(range(1, len(lines) + 1))
@@ -1671,7 +2299,91 @@ def density_finding(
         "density",
         f"{n_cmt} of {total} {unit} ({ratio:.0%}); "
         f"reference practice is under {ceiling:.0%}",
+        SHORTEN,
     )
+
+
+def strict_allowed(b: Comment) -> bool:
+    """Whether strict mode lets a change add `b`.
+
+    A Python docstring, or a comment a tool reads: a lint directive, a
+    Dockerfile's `# syntax=`, a pinned action's `# v4.1.1`. Code can need one to
+    pass a check, so refusing it would refuse the code.
+    """
+    if b.kind == DOC and b.lang == "python":
+        return True
+    lang = LANGUAGES.get(b.lang)
+    return bool(DIRECTIVE.match(b.body)) or bool(
+        lang and lang.veto and lang.veto.match(b.body)
+    )
+
+
+def comment_rows(blocks: list[Comment]) -> list[tuple[int, str]]:
+    """Each non-empty line of `blocks` as (line number, stripped text).
+
+    A block with no text is the one row `(line, "")`, so an empty comment can be
+    new too, unless an own-line comment with text touches it. Then it is a blank
+    line in that comment, which `group_blocks` leaves unmerged as it does every
+    exempt line.
+    """
+    texted = {
+        n
+        for b in blocks
+        if b.body and not b.inline
+        for n in range(b.line, b.line + b.span)
+    }
+    out = []
+    for b in blocks:
+        rows = [(n, t.strip()) for n, t in enumerate(b.lines, b.line) if t.strip()]
+        if rows:
+            out += rows
+        elif b.inline or texted.isdisjoint({b.line - 1, b.line + b.span}):
+            out.append((b.line, ""))
+    return out
+
+
+def new_comment_rows(
+    blocks: list[Comment], added: set[int] | None, base: list[Comment]
+) -> set[tuple[int, str]]:
+    """The `comment_rows` of `blocks` that a change adds to `base`, the blocks of the
+    file before it.
+
+    Counted, not looked up. The unchanged lines spend `base`'s copies of their
+    text first, then the changed lines spend what is left, in file order, and a
+    changed line with no copy left is new. So a comment moved or reindented
+    spends its own copy and adds nothing, while a second copy pasted in with the
+    code under it is new, whichever of the two git's diff calls changed.
+    """
+    rows = comment_rows(blocks)
+    left = Counter(t for _, t in comment_rows(base))
+    for n, t in rows:
+        if added is not None and n not in added:
+            left[t] -= 1
+    new = set()
+    for n, t in rows:
+        if added is None or n in added:
+            if left[t] > 0:
+                left[t] -= 1
+            else:
+                new.add((n, t))
+    return new
+
+
+def strict_finding(b: Comment, new: set[tuple[int, str]]) -> Finding | None:
+    """The text `b` adds as a strict finding, or None if it adds none.
+
+    `new` is `new_comment_rows`, so reindenting a comment, moving it or editing
+    the code beside it adds nothing. Where a block only gained lines, the
+    finding cuts those and keeps the rest: strict never asks for a comment
+    someone else wrote to go.
+    """
+    rows = comment_rows([b])
+    fresh = [t for n, t in rows if (n, t) in new]
+    if not fresh:
+        return None
+    if len(fresh) == len(rows):
+        return Finding(b.line, STRICT, b.body or "(empty comment)", DELETE)
+    return Finding(b.line, STRICT, b.body, SHORTEN, " ".join(fresh))
 
 
 Sweep = Callable[[list[Comment], list[str]], list[Finding]]
@@ -1684,6 +2396,8 @@ def analyze(
     *,
     unreviewed: bool = False,
     sweep: Sweep | None = None,
+    strict: bool = False,
+    base: str | None = None,
 ) -> list[Finding]:
     """Every finding on `src`, read as the file at `path`, within the `added` lines.
 
@@ -1696,25 +2410,46 @@ def analyze(
     fired on -- and returns its own findings; it is how `--llm` joins.
     """
     raw = extract(src, path)
+    lang = language_of(path)
+    # The model is asked about code comments, so a language with its own tiers
+    # hands it nothing. Nor does strict mode ask anything of one.
+    swept = sweep is not None and not (lang and lang.tiers)
+    strict = strict and not (lang and lang.tiers)
+    blocks = group_blocks(raw)
+    # `base` is the file at the comparison ref. None is a file the ref lacks,
+    # where every comment is new.
+    new = (
+        new_comment_rows(
+            blocks, added, group_blocks(extract(base, path)) if base is not None else []
+        )
+        if strict
+        else set()
+    )
     lines = src.split("\n")
     out: list[Finding] = []
     residue: list[Comment] = []
-    for b in group_blocks(raw):
+    headings = heading_starts(raw, lines)
+    for b in blocks:
         # Scoping intersects the block's PHYSICAL range; the tiers judge the
         # classified lines. For a doc block those differ.
         if added is not None and added.isdisjoint(range(b.line, b.line + b.span)):
             continue
+        if strict and not strict_allowed(b):
+            found = strict_finding(b, new)
+            if found:
+                out.append(found)
+                continue
         before = lines[b.line - 1][: b.col].strip()
-        context = block_context(lines, b, 4)
-        s = subject(b, before or (context[0] if context else ""))
+        context = block_context(lines, b, 4, headings, by_statement=True)
+        s = subject(b, before or (context[0] if context else ""), tuple(context))
         if exempt(s):
             continue
-        reason = fires(s, unreviewed)
-        if reason:
+        v = verdict(s, unreviewed)
+        if v:
             # Judged on the prologue, reported whole: the author needs to see
             # the comment they wrote, not the slice the tiers looked at.
-            out.append(Finding(b.line, reason, b.body))
-        else:
+            out.append(Finding(b.line, v.reason, b.body, v.action, v.cut))
+        elif swept:
             residue.append(b)
     out = out[:MAX_REPORT]
     if sweep is not None and residue:
@@ -1760,6 +2495,42 @@ def added_lines(path: str, ref: str = "HEAD") -> set[int] | None:
         start, count = int(m.group(1)), int(m.group(2) or 1)
         out.update(range(start, start + count))
     return out
+
+
+def base_source(path: str, ref: str = "HEAD") -> str | None:
+    """The file at `path` as `ref` has it, or None if `ref` has no such file.
+
+    Named relative to the file's own directory, as `added_lines` names it, so
+    the two answer for the same file. A file git pairs as a rename is read at
+    its old path, or a `git mv` would make every comment in it new.
+    """
+    full = os.path.abspath(path)
+    cwd = os.path.dirname(full)
+    try:
+        rc, src = _git(["show", f"{ref}:./{os.path.basename(full)}"], cwd)
+        if rc != 0 and (old := renamed_from(full, ref)):
+            rc, src = _git(["show", f"{ref}:{old}"], cwd)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return src if rc == 0 else None
+
+
+def renamed_from(full: str, ref: str) -> str | None:
+    """The repository path that `full` was renamed from since `ref`, if git says so."""
+    cwd = os.path.dirname(full)
+    rc, prefix = _git(["rev-parse", "--show-prefix"], cwd)
+    if rc != 0:
+        return None
+    rc, out = _git(["diff", "-M", "--name-status", "--diff-filter=R", "-z", ref], cwd)
+    if rc != 0:
+        return None
+    new = prefix.strip() + os.path.basename(full)
+    # Each rename is three fields: its similarity, then the old and new paths.
+    fields = out.split("\0")
+    for i in range(0, len(fields) - 2, 3):
+        if fields[i + 2] == new:
+            return fields[i + 1]
+    return None
 
 
 def repo_root(start: str) -> str | None:
@@ -1871,12 +2642,6 @@ def _llm_sweep(hook: bool) -> Sweep | None:
     return guarded
 
 
-CONVENTION = (
-    "Repo convention: comment the non-obvious why, not the what.\n"
-    "Delete or rewrite these, or explain why each is load-bearing."
-)
-
-
 def scan(
     path: str,
     *,
@@ -1884,11 +2649,13 @@ def scan(
     sweep: Sweep | None = None,
     whole_file: bool = False,
     ref: str = "HEAD",
+    strict: bool = False,
 ) -> list[Finding]:
     """`analyze` the file at `path`, scoped to the lines changed since `ref`.
 
     The I/O half of the pipeline: an unsupported, oversized or undecodable file
-    reports nothing, and `whole_file` skips the git question entirely.
+    reports nothing, and `whole_file` skips the git question entirely. Under
+    `strict` it also reads the file at `ref`, where git reports changed lines.
     """
     if language_of(path) is None:
         return []
@@ -1900,7 +2667,16 @@ def scan(
     except (OSError, UnicodeDecodeError):
         return []
     added = None if whole_file else added_lines(path, ref)
-    return analyze(src, path, added, unreviewed=unreviewed, sweep=sweep)
+    base = base_source(path, ref) if strict and added else None
+    return analyze(
+        src,
+        path,
+        added,
+        unreviewed=unreviewed,
+        sweep=sweep,
+        strict=strict,
+        base=base,
+    )
 
 
 def _display(path: str) -> str:
@@ -1912,13 +2688,14 @@ def _display(path: str) -> str:
 
 
 def report(path: str, findings: list[Finding]) -> str:
-    rows = [
+    rows = []
+    for f in findings:
         # density carries a whole sentence, not a quoted comment, so it is not
         # truncated to the comment-preview width
-        f"  L{f.line:<4} {'[' + f.reason + ']':<20}"
-        f"{f.text if f.reason == 'density' else f.text[:60]}"
-        for f in findings
-    ]
+        shown = f.text
+        if f.reason != "density":
+            shown = (f"cut: {f.cut}" if f.cut else f.text)[:60]
+        rows.append(f"  L{f.line:<4} {f.action:<8}{'[' + f.reason + ']':<20}{shown}")
     return "\n".join([f"comment-slop: {_display(path)}", *rows])
 
 
@@ -2013,6 +2790,14 @@ def main(argv: list[str] | None = None) -> int:
         "(high recall, low precision \u2014 manual sweeps only)",
     )
     ap.add_argument(
+        "--strict",
+        action="store_true",
+        default=os.environ.get("COMMENT_SLOP_STRICT", "") not in ("", "0"),
+        help="report every comment the change adds, Python docstrings and tool "
+        "directives excepted. COMMENT_SLOP_STRICT=1 sets it, and reaches a hook "
+        "or commit gate that takes no flags",
+    )
+    ap.add_argument(
         "--llm",
         action="store_true",
         help="also ask the local model which comments are narration "
@@ -2058,6 +2843,7 @@ def main(argv: list[str] | None = None) -> int:
     sweep = _llm_sweep(a.hook) if a.llm else None
 
     blocks = []
+    conventions: dict[str, None] = {}
     for p in paths:
         try:
             findings = scan(
@@ -2066,16 +2852,21 @@ def main(argv: list[str] | None = None) -> int:
                 sweep=sweep,
                 whole_file=a.whole_file,
                 ref=ref,
+                strict=a.strict,
             )
         except Exception:
             continue
         if findings:
             blocks.append(report(p, findings))
+            lang = language_of(p)
+            conventions[lang.convention if lang else CONVENTION] = None
+            if any(f.reason == STRICT for f in findings):
+                conventions[STRICT_CONVENTION] = None
     if not blocks:
         return 0
 
     print("\n\n".join(blocks), file=sys.stderr)
-    print(CONVENTION, file=sys.stderr)
+    print("\n".join(conventions), file=sys.stderr)
     return 2
 
 

@@ -14,9 +14,11 @@ assembles the steps: a second assembly is a second place to leave out part of
 the exemption set.
 
 1. **Extract.** `LANGUAGES` holds one `Lang` record per language: its
-   extensions (or, for a Dockerfile, its file-name stems), its lexer, the tiers
-   it suppresses, its per-comment and per-block vetoes, and its density
-   ceiling. Adding a language is one `Lang` plus one lexer. Each lexer returns
+   extensions (or, for a Dockerfile, its file-name stems, and for a changelog
+   its whole name), its lexer, the tiers it suppresses, its per-comment and
+   per-block vetoes, its density ceiling, and the convention its report states.
+   A language whose units are not code comments names its own `tiers` instead;
+   see [Changelogs](#changelogs). Adding a language is one `Lang` plus one lexer. Each lexer returns
    frozen `Comment` dataclasses carrying their physical lines as a tuple; `span`
    and `body` derive from that tuple, so they cannot drift apart from it.
    `extract()` then stamps `lang` and `inline` on every comment and drops the
@@ -29,21 +31,59 @@ the exemption set.
    standalone, so a run of dashes cannot hide inside neighbouring prose.
 3. **Scope.** A block is scanned if the diff touches **any** line of its span.
 4. **Exempt.** `exempt()` is the one copy of the exemption set: an empty or
-   `#:`-prefixed body, `NEVER`, and the language's `veto` and `block_veto`.
-5. **Classify.** `fires()` walks `TIERS`, one ordered tuple of
-   `Tier(name, test, inline_ok)`, and the first to fire names the finding.
+   `#:`-prefixed body, `NEVER`, and the language's `veto` and `block_veto`. A
+   language with its own `tiers` is exempt only when empty.
+5. **Classify.** `first_tier()` walks `TIERS` (or the language's own `tiers`),
+   one ordered tuple of `Tier(name, test, inline_ok, action, cut)`, and the first
+   to fire names the finding. `verdict()` adds the fix. A tier without a `cut`
+   asks for its `action`. A tier with one objects to part of the comment: it asks
+   to `shorten`, naming that part, when the rest stands as a comment, and to
+   `delete` when it does not (the README's *Delete or shorten*). The rest is
+   judged by `verdict` itself, so a second tier's objection is cut in turn.
+   A `Subject` carries the code lines below the block as well as its target
+   line, because a heading's verdict turns on them: `heads_group()` asks
+   whether it names several statements, and appears in none, rather than the
+   one it sits on, a plural matching its singular. `statements()` splits them by
+   bracket depth, with a top-level comma separating sibling fields; a line
+   opening with `?`, `:`, `&&` or `||` continues the one above, and a shell `if`
+   or `for` is one statement, as is a first line ending in a header's `{`, though
+   not the `{` of `x = {`, where only a value can go. `analyze` reads the context
+   `by_statement`, so the lines of a dict or a wrapped call do not use up the
+   window before the statements beside it. `block_context()` stops at a Python
+   dedent before stripping indentation, and at the next own-line comment at the
+   heading's column (`heading_starts()`), which heads the code below it. A `#:`
+   field note heads nothing, which is why `heading_starts()` reads the source
+   lines.
+   The restatement tier asks `heads_siblings()` instead, so a heading whose
+   words run through two sibling declarations reads as their shared prefix; a
+   call and an `assert` on its result declare nothing. Over a definition,
+   `restates()` drops only the kind nouns its keyword licenses (`kind_nouns()`),
+   so `enum` over a `def` still counts.
    `unreviewed` is an opt-in last tier, so it can only ever see a block that
    `exempt` let through and no real tier caught. `block_reason()` is `exempt`
-   then `fires` for a single block, which is what corpus generation, snapshot
-   scoring and the firing-rate bands call; `recalibrate.py` asks `exempt` alone.
-6. **Report.** Exit 2 with the findings, exit 0 clean. Any internal failure
-   exits 0.
+   then `fires` for a single block, which corpus generation and the firing-rate
+   bands call, and `block_verdict()` is the same with the fix, which snapshot
+   scoring calls; `recalibrate.py` asks `exempt` alone.
+6. **Report.** One row per finding: its line, its action, its tier, and the
+   comment, or `cut:` and the part to remove. Exit 2 with the findings, exit 0
+   clean. Any internal failure exits 0.
 
 What the walk leaves — in scope, not exempt, fired on by nothing — is handed to
 the optional `sweep` callback, which is how `--llm` (`comment_slop_llm.py`)
 joins; `main` imports that module only when `--llm` is passed. The sweep has no
 scope or exemption checks of its own, so it cannot disagree with the tiers about
 what is in the diff or what is exempt.
+
+`strict` joins between scope and exempt. A block in scope that
+`strict_allowed()` does not spare (a Python docstring, a lint directive, the
+language's `veto`) goes to `strict_finding()` before `exempt`, because what
+strict exists to report is what `NEVER` would spare. A line is new where the
+diff touched it and its text is not among the comment lines `extract()` finds in
+`base`, the file at the comparison ref; `scan()` reads that with `git show`, and
+only under `strict` where git reported changed lines. `base_source()` reads a
+file git reports as renamed at its old path. A block with no new line
+carries on to `exempt` and the tiers, so strict flags every comment the default
+does, and more.
 
 `extract()` wraps every lexer call in `try/except Exception` returning `[]`:
 a defect in one lexer degrades that file to "no findings" rather than breaking
@@ -202,6 +242,28 @@ The fallback triggers at zero code lines only; code-thin diffs (1–2 lines) kee
 the diff ratio, because widening it to `n_code < 3` would exempt the narration
 shapes the comment floor exists for.
 
+## Changelogs
+
+A `CHANGELOG.md` is prose with a format, not code, so its `Lang` carries its own
+`tiers` (`verbose`, `multi-line`, `pr-link`) and the machinery built for comments
+stands aside:
+
+- `NEVER` would exempt every entry: each ends in the URL and `#123` that it
+  spares in a code comment.
+- The comment tiers would read a changelog's grammar as slop. `Added …` is edit
+  narration, `previously …` is history and a speed-up is a benchmark, and all
+  three are what an entry is for.
+- Density would call a file of entries 100% comment.
+- `--include-unreviewed` and `--llm` ask about code comments, so neither sees an
+  entry.
+
+`changelog_entries` makes each top-level list item one `Comment`, with
+`mergeable=False` so neighbouring entries never merge. Its `lines` hold every
+line Markdown gives the item, continuation and nested list included, which is
+what `multi-line` counts and what scoping intersects: an edit to the second
+line of a wrapped entry judges the whole entry. Each report ends with its
+languages' conventions, once each, so the changelog's asks for the link format.
+
 ## Verifying a lexer change
 
 Golden tests prove the cases we thought of. The tree-sitter differential proves
@@ -289,6 +351,9 @@ The remaining 144 agree exactly, with zero over-reports either way.
   `RUN`/`COPY`/`ADD` itself; its body is then read as ordinary lines. Restricting
   the search to those three instructions is what stops a `<<` inside an argument
   from opening a heredoc and silencing the rest of the file.
+- A changelog named anything but `CHANGELOG.md` — `CHANGES.md`, `HISTORY.md`,
+  `NEWS.md` — and one in reStructuredText, whose link syntax `pr-link` does not
+  read.
 - `bare-identifier` fires on single-token math annotations (`alpha`, `lda`, `p`)
   that name BLAS/LAPACK operands in scientific Rust. Terse by necessity; left
   alone deliberately.

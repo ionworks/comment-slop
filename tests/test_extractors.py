@@ -42,7 +42,7 @@ class TestRegistry:
         seen: dict[str, str] = {}
         for lang in cs.LANGUAGES.values():
             assert callable(lang.extract), lang.name
-            for key in lang.exts | lang.stems:
+            for key in lang.exts | lang.stems | lang.names:
                 assert key not in seen, (key, seen.get(key), lang.name)
                 seen[key] = lang.name
 
@@ -71,13 +71,14 @@ class TestRegistry:
         """The lexers leave `lang` unset; `extract` owns it, so no lexer can
         forget it."""
         for name, lang in cs.LANGUAGES.items():
-            ext = sorted(lang.exts)[0]
-            src = (
-                "# a\n"
-                if name in ("python", "yaml", "toml", "shell", "dockerfile")
-                else "// a\n"
-            )
-            got = cs.extract(src, "x" + ext)
+            path = f"x{min(lang.exts)}" if lang.exts else min(lang.names)
+            if name in ("python", "yaml", "toml", "shell", "dockerfile"):
+                src = "# a\n"
+            elif name == "changelog":
+                src = "- a\n"
+            else:
+                src = "// a\n"
+            got = cs.extract(src, path)
             assert got and {c.lang for c in got} == {name}, name
             assert {c.lang for c in lang.extract(src)} == {""}, name
 
@@ -786,6 +787,13 @@ class TestDockerfileDirectiveGuard:
     def test_forms_the_veto_must_not_reach(self, body):
         assert not cs.vetoed(body, "dockerfile")
 
+    def test_a_directive_merges_with_no_comment(self):
+        directive, prose = cs.extract(
+            "# syntax=docker/dockerfile:1\n# Build deps first.\nFROM alpine\n",
+            "Dockerfile",
+        )
+        assert (directive.mergeable, prose.mergeable) == (False, True)
+
     DIRECTIVES = (
         "# syntax=docker/dockerfile:1\n"
         "# escape=\\\n"
@@ -1237,6 +1245,61 @@ class TestJsxTextIsNotCode:
         src = "const g = <A, B>(a: A) => a;\n// Reworked g\n"
         assert [c.body for c in cs.js_comments(src)] == ["Reworked g"]
 
+    def test_type_arguments_do_not_close_the_tag(self):
+        """`<Picker<Tag, true>` passes type arguments to a component. Their `>`
+        is not the tag's: taken as one, the props after it read as children
+        and the comments among them vanish."""
+        src = (
+            "const A = () => (\n"
+            "  <Picker<Tag, true>\n"
+            "    multiple\n"
+            "    // Enter takes the closest match.\n"
+            "    autoHighlight\n"
+            "  />\n"
+            ");\n"
+        )
+        assert [(c.line, c.body) for c in cs.js_comments(src)] == [
+            (4, "Enter takes the closest match.")
+        ]
+
+    def test_nested_type_arguments_and_function_types(self):
+        """Nesting counts each `<`, and the `>` of a `=>` in a function type
+        closes nothing."""
+        src = (
+            "const A = () => (\n"
+            "  <Grid<Map<string, (x: number) => void>>\n"
+            "    // Rows keyed by id.\n"
+            "    rows={rows}\n"
+            "  />\n"
+            ");\n"
+            "// Reworked the grid\n"
+        )
+        assert [c.body for c in cs.js_comments(src)] == [
+            "Rows keyed by id.",
+            "Reworked the grid",
+        ]
+
+    def test_template_literal_types_in_type_arguments(self):
+        """A template type's brackets are its text: counted as the tag's, the
+        URL in the children reads as a `//` comment."""
+        src = "const A = () => <Box<`<`>>https://example.test</Box>;\n"
+        assert cs.js_comments(src) == []
+
+    def test_template_literal_type_substitutions_in_type_arguments(self):
+        """`${...}` in a template type, with a `>` in its text, still leaves the
+        tag open for the comments among its props."""
+        src = (
+            "const A = () => (\n"
+            "  <Box<`>${Lowercase<K>}`>\n"
+            "    // Keys arrive lowercased.\n"
+            "    keys={keys}\n"
+            "  >https://example.test</Box>\n"
+            ");\n"
+        )
+        assert [(c.line, c.body) for c in cs.js_comments(src)] == [
+            (3, "Keys arrive lowercased.")
+        ]
+
     def test_self_closing_elements_do_not_open_a_children_region(self):
         src = 'const A = () => <Icon name="x" />;\n// Tweaked the icon\n'
         assert [c.body for c in cs.js_comments(src)] == ["Tweaked the icon"]
@@ -1282,3 +1345,102 @@ class TestJsxTextIsNotCode:
     def test_a_regex_character_class_may_contain_a_slash(self):
         src = "const re = /[/]/;\n// Loosened the pattern\n"
         assert [c.body for c in cs.js_comments(src)] == ["Loosened the pattern"]
+
+
+def entries(src):
+    """(line, lines) pairs: where an entry starts and every line it holds."""
+    return [(c.line, c.lines) for c in cs.changelog_entries(src)]
+
+
+class TestChangelogNaming:
+    """A changelog shares `.md` with every README, so only its whole name
+    identifies it."""
+
+    @pytest.mark.parametrize(
+        "name", ["CHANGELOG.md", "changelog.md", "Changelog.md", "pkg/CHANGELOG.md"]
+    )
+    def test_recognised_names(self, name):
+        assert cs.language_of(name).name == "changelog"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "README.md",
+            "CHANGELOG",
+            "CHANGELOG.rst",
+            "debian/changelog",
+            "docs/changelog.mdx",
+            "CHANGELOG.md.bak",
+        ],
+    )
+    def test_names_the_dispatch_must_not_claim(self, name):
+        lang = cs.language_of(name)
+        assert lang is None or lang.name != "changelog"
+
+
+class TestChangelogEntries:
+    def test_each_top_level_item_is_one_entry(self):
+        src = (
+            "# Changelog\n\nIntro prose.\n\n## [1.0.0] - 2026-01-01\n\n"
+            "### Added\n- one\n- two\n"
+        )
+        assert entries(src) == [(8, ("one",)), (9, ("two",))]
+
+    def test_a_wrapped_entry_keeps_its_continuation(self):
+        assert entries("- first half\n  second half\n- next\n") == [
+            (1, ("first half", "second half")),
+            (3, ("next",)),
+        ]
+
+    def test_an_unindented_line_under_an_item_continues_it(self):
+        """Markdown's lazy continuation: the paragraph carries on."""
+        assert entries("- first half\nsecond half\n") == [
+            (1, ("first half", "second half"))
+        ]
+
+    def test_a_nested_list_belongs_to_its_parent(self):
+        assert entries("- parent\n  - child\n  - child two\n- sibling\n") == [
+            (1, ("parent", "- child", "- child two")),
+            (4, ("sibling",)),
+        ]
+
+    def test_an_indented_paragraph_after_a_blank_line_is_still_the_item(self):
+        """Each blank line is kept, so the span reaches the paragraph and an edit
+        to it is scoped to the entry."""
+        assert entries("- one\n\n\n  more of one\n\n- two\n") == [
+            (1, ("one", "", "", "more of one")),
+            (6, ("two",)),
+        ]
+
+    def test_a_blank_line_then_prose_ends_the_item(self):
+        assert entries("- one\n\nNot part of it.\n") == [(1, ("one",))]
+
+    def test_a_heading_ends_the_item(self):
+        assert entries("- one\n### Fixed\n- two\n") == [(1, ("one",)), (3, ("two",))]
+
+    def test_the_link_table_is_not_a_continuation(self):
+        src = "- one\n[1.0.0]: https://example.com/compare/v0.9...v1.0\n"
+        assert entries(src) == [(1, ("one",))]
+
+    def test_fenced_and_commented_examples_are_not_entries(self):
+        src = (
+            "```md\n- example\n```\n<!--\n- template\n-->\n<!-- - inline -->\n- real\n"
+        )
+        assert entries(src) == [(8, ("real",))]
+
+    def test_only_the_opening_fence_marker_closes_it(self):
+        src = "~~~\n```\n- example\n~~~\n- real\n"
+        assert entries(src) == [(5, ("real",))]
+
+    def test_a_fence_line_with_text_after_it_does_not_close_one(self):
+        src = "~~~\n~~~example\n- example\n~~~\n- real\n"
+        assert entries(src) == [(5, ("real",))]
+
+    def test_every_list_marker(self):
+        assert [ln for ln, _ in entries("- a\n* b\n+ c\n")] == [1, 2, 3]
+
+    def test_a_rule_or_emphasis_is_not_an_item(self):
+        assert entries("---\n**Bold** line\n-not a bullet\n") == []
+
+    def test_crlf(self):
+        assert entries("- one\r\n  two\r\n") == [(1, ("one", "two"))]

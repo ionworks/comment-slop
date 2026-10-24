@@ -179,6 +179,25 @@ class TestNeverVeto:
         for body in ["BUG: broken", "NOTE: careful", "SAFETY: locked", "XXX"]:
             assert cs.NEVER.search(body), body
 
+    def test_a_hex_colour_is_not_an_issue_reference(self):
+        """`#020E0D` read as issue #020, and the veto split the palette comment
+        it sat in."""
+        for body in [
+            "Brand primary is dark green-black (#020E0D). That works as a",
+            "the accent is #0C68E9 in both modes",
+        ]:
+            assert not cs.NEVER.search(body), body
+        assert cs.NEVER.search("removed in #256 and no longer defined")
+
+    def test_an_encoding_or_hash_name_is_not_an_issue_key(self):
+        """`UTF-8` was 18 of 24 blocks this repo exempted on the key form alone."""
+        for body in [
+            "most vendor files are not UTF-8, so decode as latin-1",
+            "the database keeps only a SHA-256 hash and the prefix",
+        ]:
+            assert not cs.NEVER.search(body), body
+        assert cs.NEVER.search("fixes ABC-123")
+
     def test_a_region_name_is_not_an_issue_key(self):
         """`east-1` would match the issue-key form under IGNORECASE."""
         for body in [
@@ -368,16 +387,30 @@ class TestScan:
 
 
 class TestReport:
-    def test_contains_path_line_reason_and_text(self):
-        findings = [cs.Finding(42, "banner", "===== SIZING =====")]
+    def test_contains_path_line_action_reason_and_text(self):
+        findings = [cs.Finding(42, "banner", "===== SIZING =====", cs.DELETE)]
         text = cs.report("a/b.py", findings)
         assert "comment-slop: a/b.py" in text
         assert "L42" in text
+        assert "delete" in text
         assert "[banner]" in text
         assert "===== SIZING =====" in text
 
+    def test_a_shortening_finding_shows_the_part_to_cut(self):
+        """The author keeps the comment, so the row names what to take out of it."""
+        f = cs.Finding(
+            7,
+            "historical",
+            "Batches stay small. Previously it sent one.",
+            cs.SHORTEN,
+            "Previously it sent one.",
+        )
+        row = cs.report("a.py", [f]).splitlines()[1]
+        assert "shorten" in row and "cut: Previously it sent one." in row
+        assert "Batches stay small" not in row
+
     def test_long_comment_text_is_truncated(self):
-        findings = [cs.Finding(1, "unreviewed", "x" * 200)]
+        findings = [cs.Finding(1, "unreviewed", "x" * 200, cs.DELETE)]
         assert "x" * 61 not in cs.report("a.py", findings)
 
 
@@ -426,6 +459,108 @@ class TestMain:
         assert cs.main([str(a), str(b)]) == 2
         err = capsys.readouterr().err
         assert "a.py" in err and "b.py" in err
+
+
+class TestStrict:
+    """`--strict`, or COMMENT_SLOP_STRICT in the environment: the environment is
+    what reaches both a session's hook and a commit's gate."""
+
+    WHY = "    # The writer holds the lock for one poll interval at most.\n"
+    BEFORE = "def f():\n" + WHY + "    wait_for(lock)\n"
+
+    def repo_with(self, tmp_path, src="def f():\n    wait_for(lock)\n"):
+        repo = make_repo(tmp_path)
+        (repo / "sub").mkdir()
+        f = repo / "sub" / "a.py"
+        f.write_text(src)
+        commit_all(repo)
+        return f
+
+    def test_the_flag_reports_a_new_comment_and_says_why(self, tmp_path, capsys):
+        f = self.repo_with(tmp_path)
+        f.write_text(self.BEFORE)
+        assert cs.main([str(f)]) == 0
+        assert cs.main(["--strict", str(f)]) == 2
+        err = capsys.readouterr().err
+        assert "[strict]" in err
+        assert cs.STRICT_CONVENTION in err
+
+    def test_the_strict_convention_needs_a_strict_finding(self, tmp_path, capsys):
+        f = tmp_path / "a.py"
+        f.write_text('def f():\n    """Fixed: skip None entries."""\n')
+        assert cs.main(["--strict", str(f)]) == 2
+        err = capsys.readouterr().err
+        assert "[edit-narration]" in err
+        assert cs.STRICT_CONVENTION not in err
+
+    @pytest.mark.parametrize("value, code", [("1", 2), ("0", 0), ("", 0)])
+    def test_the_environment_turns_it_on(self, tmp_path, monkeypatch, value, code):
+        f = self.repo_with(tmp_path)
+        f.write_text(self.BEFORE)
+        monkeypatch.setenv("COMMENT_SLOP_STRICT", value)
+        assert cs.main([str(f)]) == code
+
+    def test_the_hook_reads_the_environment(self, tmp_path, capsys, monkeypatch):
+        f = self.repo_with(tmp_path)
+        f.write_text(self.BEFORE)
+        payload = {"tool_input": {"file_path": str(f)}}
+        monkeypatch.setenv("COMMENT_SLOP_STRICT", "1")
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+        assert cs.main(["--hook"]) == 2
+        assert "[strict]" in capsys.readouterr().err
+
+    def test_a_committed_comment_reindented_is_not_new(self, tmp_path, monkeypatch):
+        """Read through git, from a relative path in a subdirectory, the way
+        `added_lines` resolves the same file."""
+        f = self.repo_with(tmp_path, self.BEFORE)
+        f.write_text(
+            "def f():\n    if ready:\n    " + self.WHY + "        wait_for(lock)\n"
+        )
+        monkeypatch.chdir(tmp_path)
+        assert cs.added_lines("sub/a.py") == {2, 3, 4}
+        assert cs.scan("sub/a.py", strict=True) == []
+
+    def test_a_renamed_file_is_compared_with_its_old_path(self, tmp_path, capsys):
+        """Into another directory, so the old and new paths share no prefix."""
+        self.repo_with(tmp_path, self.BEFORE)
+        (tmp_path / "other").mkdir()
+        subprocess.run(
+            ["git", "mv", "sub/a.py", "other/b.py"], cwd=tmp_path, check=True
+        )
+        moved = tmp_path / "other" / "b.py"
+        moved.write_text(self.BEFORE + "\n\ndef g():\n    return 1\n")
+        assert cs.scan(str(moved), strict=True) == []
+        # Only the line the change added is new, not the comment it extends.
+        moved.write_text(
+            "def f():\n" + self.WHY + "    # Polls until the writer lets go.\n"
+            "    wait_for(lock)\n"
+        )
+        assert cs.main(["--strict", str(moved)]) == 2
+        assert "cut: Polls until the writer lets go." in capsys.readouterr().err
+
+    def test_a_committed_comment_pasted_again_is_new(self, tmp_path, capsys):
+        f = self.repo_with(tmp_path, self.BEFORE)
+        f.write_text(self.BEFORE + "\n\n" + self.BEFORE.replace("f()", "g()"))
+        assert cs.main(["--strict", str(f)]) == 2
+        assert "L7    delete  [strict]" in capsys.readouterr().err
+
+    def test_since_compares_against_that_ref(self, tmp_path, capsys):
+        f = self.repo_with(tmp_path, self.BEFORE)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        f.write_text(
+            "def f():\n" + self.WHY + "    # Polls until the writer lets go.\n"
+            "    wait_for(lock)\n"
+        )
+        commit_all(tmp_path)
+        assert cs.main(["--strict", str(f)]) == 0
+        assert cs.main(["--strict", "--since", base, str(f)]) == 2
+        assert "cut: Polls until the writer lets go." in capsys.readouterr().err
 
 
 class TestBlockGrouping:
@@ -616,6 +751,35 @@ class TestLateTiers:
         f = cs.analyze(src, "a.py", None)
         assert [i.reason for i in f] == ["process-leak"]
 
+    def test_a_quoted_step_is_the_data_not_a_plan(self):
+        for body in [
+            'Parent keeps its own unprefixed "Step 0: Step_H"',
+            'the parser raises "step 10 has no termination" here',
+        ]:
+            assert cs.analyze(f"# {body}\nrun()\n", "a.py", None) == [], body
+
+    def test_a_step_outside_the_quotes_still_leaks(self):
+        body = 'rename "step 1" in the YAML during phase 3'
+        f = cs.analyze(f"# {body}\nrun()\n", "a.py", None)
+        assert [i.reason for i in f] == ["process-leak"]
+        # The cut takes the plan's phase and leaves the quoted step.
+        assert cs.drop_matches(cs.PROCESS_LEAK, cs.unquoted)(body) == (
+            "phase 3",
+            'rename "step 1" in the YAML during',
+        )
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            'sized in this PR so the 3" pipe matches',
+            'the 3" pipe was sized in this PR',
+            'the 3" and 4" pipes were sized in this PR',
+        ],
+    )
+    def test_an_unpaired_quote_does_not_hide_a_leak(self, body):
+        f = cs.analyze(f"# {body}\nrun()\n", "a.py", None)
+        assert [i.reason for i in f] == ["process-leak"]
+
     def test_previously_is_historical(self):
         src = "# an optimizer with no population_size previously skipped this\nsize()\n"
         f = cs.analyze(src, "a.py", None)
@@ -625,6 +789,15 @@ class TestLateTiers:
         src = "# broken on prod 2026-07-10 when the head node changed\nfix()\n"
         f = cs.analyze(src, "a.py", None)
         assert [i.reason for i in f] == ["historical"]
+
+    def test_a_date_in_a_format_example_is_not_history(self):
+        for body in [
+            "@output 2024-05-28T05:55:31+00:00",
+            "rendered as absolute UTC, e.g. 2026-07-27 14:30",
+            'a range filter such as {"created_at": "gte.2024-01-01"}',
+            "reads the plans under dev-docs/plans/2026-09-26-relabel",
+        ]:
+            assert cs.analyze(f"# {body}\nrun()\n", "a.py", None) == [], body
 
     def test_a_pronoun_subject_makes_used_to_historical(self):
         for body in [
@@ -653,6 +826,51 @@ class TestLateTiers:
             "an unedited, previously-picked template can be reused",
         ]:
             assert cs.analyze(f"# {body}\nrun()\n", "a.py", None) == [], body
+
+    def test_a_data_participle_names_the_data_not_its_history(self):
+        """A participle naming data the code reads is not a claim about past code."""
+        for body in [
+            "fit against a previously measured OCV curve",
+            "load previously fitted parameters from the last run",
+            "cases originally labelled keep score as keep",
+            "the file as originally uploaded, when one exists",
+        ]:
+            assert cs.analyze(f"# {body}\nrun()\n", "a.py", None) == [], body
+
+    def test_a_data_verb_with_an_object_is_still_history(self):
+        f = cs.analyze("# this previously saved the file twice\nrun()\n", "a.py", None)
+        assert [i.reason for i in f] == ["historical"]
+
+    def test_a_data_verb_after_a_subject_is_history(self):
+        """A bare plural reads as data after the adverb, but not with a subject."""
+        for body in [
+            "This previously saved files to local storage",
+            "it previously recorded timestamps in local time",
+            "Batches are small. That originally sampled rows at random",
+        ]:
+            f = cs.analyze(f"# {body}\nrun()\n", "a.py", None)
+            assert [i.reason for i in f] == ["historical"], body
+
+    def test_this_mid_sentence_is_a_determiner_over_data(self):
+        for body in [
+            "load this previously fitted model from the last run",
+            "fit against that previously measured OCV curve",
+        ]:
+            assert cs.analyze(f"# {body}\nrun()\n", "a.py", None) == [], body
+
+    def test_a_data_participle_opening_the_comment_is_not_edit_narration(self):
+        """`edit-narration` also reads the adverb opening a comment, and runs first."""
+        for body in [
+            "Previously measured OCV values are loaded for the fit",
+            "Previously fitted parameters seed the next run",
+            "Previously-computed offsets are cached per cell",
+            "Previously returned by the parser, the offsets seed this fit",
+        ]:
+            assert cs.analyze(f"# {body}\nrun()\n", "a.py", None) == [], body
+
+    def test_a_leading_data_verb_with_an_object_is_still_edit_narration(self):
+        f = cs.analyze("# Previously saved the file twice\nrun()\n", "a.py", None)
+        assert [i.reason for i in f] == ["edit-narration"]
 
     def test_first_person_edit_narration_is_unbuilt(self):
         """Code that never reached main: the branch cannot be looked up."""
@@ -1086,9 +1304,9 @@ class TestDisplayPath:
             raise ValueError("path is on mount 'C:', start on mount 'D:'")
 
         monkeypatch.setattr(cs.os.path, "relpath", cross_drive)
-        assert cs.report("D:\\x\\a.py", [cs.Finding(1, "banner", "===")]).startswith(
-            "comment-slop: D:\\x\\a.py"
-        )
+        assert cs.report(
+            "D:\\x\\a.py", [cs.Finding(1, "banner", "===", cs.DELETE)]
+        ).startswith("comment-slop: D:\\x\\a.py")
 
 
 class TestHumanLabelledFixes:

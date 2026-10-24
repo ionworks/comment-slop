@@ -10,8 +10,27 @@ head that wrote the rules.
 
 ## Current numbers
 
-**95% precision, 85% recall** over 121 labels (tp 76, fp 4, fn 13), scored
-from the immutable comment lines captured with each case.
+**91% precision, 77% recall** over 121 labels (tp 71, fp 7, fn 21), scored
+from the immutable comment lines captured with each case. A finding counts only
+when it asks for the fix its label names: deletion for `slop`, shortening for
+`trim` (see [Labels](#labels)).
+
+Counted instead as flagging a comment the labeller would change, whatever fix it
+asks for, the same findings are 100% precise at 85% recall (78 of 78, 78 of 92).
+The difference is seven wrong fixes. Six are `verbose` asking to shorten a
+`slop` comment: length cannot tell a long comment with nothing to keep from one
+with a fact in too many words. The seventh is base#51,
+`Test 2: Filter with x_max only`, labelled `trim` and deleted, because three words
+are left once the marker goes.
+
+Most of the move from 78%/70% (tp 62, fp 18, fn 27) is a change to the ground
+truth, not to the detector. Sixteen labels were rejudged under the three-label
+codebook, each with its reason in `eval/label-corrections.md`, and on their own
+they take the previous detector to 89%/77%. The detector's share is two false
+positives: base#42 `State` and base#92 `Step condition state`, each a heading
+over a group of fields, which the heading rule now spares. In a monorepo
+checkout, `uv run python eval/review_queue.py` lists the remaining disagreements
+for re-review; `--blind` hides the old and detector verdicts.
 
 Precision is the figure that matters: a false positive spends the author's trust,
 a miss costs nothing.
@@ -34,12 +53,89 @@ it when someone is ready to label it:
 
 which needs a `GENRES` entry that keeps inline comments instead of skipping them,
 and the `--llm` exclusion left alone (the sweep still should not judge them).
-Until then the honest reading of 95% is "over own-line comments".
+Until then the honest reading of these figures is "over own-line comments".
 
 The 39 remaining cases in `eval/corpus.txt` are unlabelled. Labelling them takes
 TypeScript from 27% to 39% of the ground truth and replaces that baseline. The
 base corpus is 160 cases, 121 labelled: **88 py / 21 tsx / 12 ts** — so the
 headline figure is about three-quarters a Python measurement.
+
+## Labels
+
+| verdict | meaning | a finding is right when it asks to |
+|---|---|---|
+| `slop` | should not exist in any form | `delete` |
+| `trim` | carries a fact worth keeping, in more words than the fact needs | `shorten` |
+| `keep` | leave it as written | — |
+| `skip` | cannot tell from what is shown | not scored |
+
+`trim` exists because the two fixes are not interchangeable. Deleting a comment
+that carries a real fact loses the fact; shortening one that carries nothing
+leaves it in place. So every finding says which it asks for, and `score.py`
+reads that action from the finding rather than guessing it from the tier:
+
+- `verbose` asks to shorten.
+- A tier objecting to part of a comment (a history clause, a `Step 1:` marker, a
+  `file.py:12` pointer) asks to shorten, naming the part to cut, when what is
+  left stands as a comment, and to delete when it does not. The README's
+  *Delete or shorten* has the rule.
+- Every other tier objects to the whole comment and asks to delete.
+- The model sweep reports what it would not keep, which is a deletion.
+
+Every slop and trim case is a positive. A finding asking for the other fix counts
+twice, as a false positive and as a miss, in either direction, so precision's
+denominator is every finding and recall's is every positive.
+
+Labels entered under the two-label scheme filed "a long explanation where a
+short one would do" as slop. One blind relabel re-judged the 73 `verbose`
+findings under the three labels, and base#51 carries its blind verdict, `trim`.
+Before the focused corrections, **160 of the 232 labels** (80 of the base
+corpus's 121) still used the earlier standard. Sixteen have since been
+rejudged; the rest still need a broad blind review. The six
+remaining `verbose` findings on `slop` are the first action disagreements to
+settle before tuning that tier.
+
+### Rulings
+
+The labeller's own reasons settle three cases the table leaves open:
+
+- **A true secondary fact can still be trimmed.** Keep the fact the reader needs
+  at that line. A parenthetical aside, a second paragraph of elaboration, or a
+  restatement of what the code does makes the comment `trim`, even when every
+  sentence is accurate. "Every sentence carries a fact" is not a reason to keep.
+- **A hardcoded file path is a liability, not a fact.** It goes stale when the
+  file moves, and a reader can search for the name. A path is a `trim` target;
+  the rest of the comment is judged without it, and is `slop` if nothing is left.
+- **A fact in the wrong place is judged as if it were moved.** A constraint that
+  belongs in a type, a docstring or the docs does not keep the comment: `slop`
+  if that fact is all it carries, `trim` if something else stays.
+
+The labelling codebook settles three more, which the tiers follow:
+
+- **A heading over a group is kept.** `State` over six fields, or `Robertson`
+  over a benchmark block, names what is below it. One paraphrasing the single
+  statement or definition it sits on is slop, and so is one naming that
+  definition with its kind: `Cleanup function` over `cleanup() {`.
+- **A formula, matrix, table or worked example is content**, never `trim` for
+  its length, so its rows count toward neither of `verbose`'s limits.
+- **A banner or step number over real content is `trim`**: the decoration goes
+  and the content is judged on its own, which is what a cut does.
+
+### `verbose`, out of sample
+
+`verbose`'s precision was first measured on labels written while its findings
+were on screen. The blind relabel re-judged the 55 `verbose` findings the
+labeller had not been shown, and marked all 55 slop or trim. With the seven
+findings already labelled keep, that is 55 of 62, against 66 of 73 in-sample.
+None of the ten comments just under the threshold came back trim, so the
+threshold sits where the labeller's shortening begins.
+
+The figure rests on one person's standard of length. Two model annotators,
+given a written codebook, kept 47 and 48 of the same 55: they keep a comment
+when every sentence carries a fact, where the labeller shortens one whose
+secondary facts (a parenthetical aside, a second paragraph) could go. No
+written rule yet reproduces that standard, so a second human labeller is the
+test this figure has not had.
 
 ## Scoring
 
@@ -47,8 +143,9 @@ headline figure is about three-quarters a Python measurement.
     cd eval && uv run --no-project python score.py --llm              # tiers + sweep
     cd eval && uv run --no-project python score.py --genre yaml --channel random
 
-Reports precision and recall against the labels and prints every false positive
-in full. Partial labelling works.
+Reports precision and recall against the labels, how many findings on a slop or
+trim case asked for the other fix, and every false positive in full, with the
+tier and action of a wrong fix. Partial labelling works.
 
 `score.py` defaults to the captured `body_lines` and following code. This is the
 classification input rather than a reconstructed source file: it preserves
@@ -56,7 +153,7 @@ physical span without requiring a partial Python fragment to parse, and it does
 not drift when the source repository later gains lines or edits the file.
 
 Every corpus carries `body_lines`, and `tests/test_corpus_schema.py` asserts that
-plus the fields `snapshot_reason` reads, the `body`/`body_lines` agreement, and
+plus the fields `snapshot_verdict` reads, the `body`/`body_lines` agreement, and
 the `### n` numbering lining up with the JSON. A corpus without `body_lines` stops
 snapshot scoring at the first verdict entered, and the gap stays invisible while
 the corpus sits at 0% labelled, because an unlabelled corpus never exercises its

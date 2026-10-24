@@ -136,6 +136,12 @@ class TestSweepIntegration:
         found = cs.scan(str(f), sweep=llm.sweep())
         assert [(i.line, i.reason) for i in found] == [(1, "narration (model)")]
 
+    def test_what_the_model_does_not_keep_is_a_deletion(self, tmp_path, monkeypatch):
+        self._capture(monkeypatch)
+        f = tmp_path / "a.py"
+        f.write_text("# Loop over every row\nfor r in rows:\n    pass\n")
+        assert [i.action for i in cs.scan(str(f), sweep=llm.sweep())] == ["delete"]
+
     def test_a_stated_reason_is_never_sent(self, tmp_path, monkeypatch):
         seen = self._capture(monkeypatch)
         f = tmp_path / "a.py"
@@ -346,7 +352,7 @@ class TestVendoredSweepModule:
             "from comment_slop import Finding\n"
             "LLM_DEADLINE = 20\n"
             "def sweep(deadline=None):\n"
-            "    return lambda residue, lines: [Finding(b.line, 'narration (model)', b.body) for b in residue]\n",
+            "    return lambda residue, lines: [Finding(b.line, 'narration (model)', b.body, 'delete') for b in residue]\n",
         )
         assert result.returncode == 2
         assert "[narration (model)]" in result.stderr

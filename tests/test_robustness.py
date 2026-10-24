@@ -13,7 +13,11 @@ import comment_slop as cs
 
 # From the registry, so a language added there gets the battery for free.
 EXTRACTORS = [(name, lang.extract) for name, lang in cs.LANGUAGES.items()]
-EXTS = [sorted(lang.exts)[0] for lang in cs.LANGUAGES.values()]
+# A changelog is known by its whole name, so no case can prefix it.
+NAMES = [
+    f"x{min(lang.exts)}" if lang.exts else min(lang.names)
+    for lang in cs.LANGUAGES.values()
+]
 
 PATHOLOGICAL = {
     "empty": "",
@@ -67,25 +71,29 @@ def test_extractor_never_raises_and_terminates(name, extractor, case):
     assert elapsed < TERMINATION_BUDGET, f"{name}/{case} took {elapsed:.1f}s"
 
 
-@pytest.mark.parametrize("ext", EXTS)
-def test_scan_survives_pathological_files(tmp_path, ext):
+def pathological_files(root, name):
     for case, src in PATHOLOGICAL.items():
-        path = tmp_path / f"{case}{ext}"
+        path = root / case / name
+        path.parent.mkdir()
         path.write_text(src, encoding="utf-8")
+        yield path
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_scan_survives_pathological_files(tmp_path, name):
+    for path in pathological_files(tmp_path, name):
         assert isinstance(cs.scan(str(path)), list)
 
 
-@pytest.mark.parametrize("ext", EXTS)
-def test_main_always_exits_zero_or_two(tmp_path, ext):
-    for case, src in PATHOLOGICAL.items():
-        path = tmp_path / f"{case}{ext}"
-        path.write_text(src, encoding="utf-8")
+@pytest.mark.parametrize("name", NAMES)
+def test_main_always_exits_zero_or_two(tmp_path, name):
+    for path in pathological_files(tmp_path, name):
         assert cs.main([str(path)]) in (0, 2)
 
 
-@pytest.mark.parametrize("ext", EXTS)
-def test_non_utf8_is_skipped(tmp_path, ext):
-    path = tmp_path / f"bad{ext}"
+@pytest.mark.parametrize("name", NAMES)
+def test_non_utf8_is_skipped(tmp_path, name):
+    path = tmp_path / name
     path.write_bytes(b"// \xff\xfe banner =====\nx = 1\n")
     assert cs.scan(str(path)) == []
 
@@ -101,10 +109,11 @@ def test_reported_positions_exist_in_the_source():
         ".toml": '# one\nkey = 1  # two\nd = """\n# not\n"""\n',
         ".sh": "# one\nset -e  # two\ncat <<EOF\n# not\nEOF\n",
         ".dockerfile": "# one\n   # two\nRUN echo '# not'\nFROM alpine\n",
+        "CHANGELOG.md": "# one\n\n- two\n  - nested\n\n  more\n",
     }
     for ext, src in samples.items():
         lines = src.split("\n")
-        for c in cs.extract(src, f"a{ext}"):
+        for c in cs.extract(src, f"a{ext}" if ext.startswith(".") else ext):
             assert 1 <= c.line <= len(lines), (ext, c)
             assert 0 <= c.col <= len(lines[c.line - 1]), (ext, c)
             assert c.span >= 1, (ext, c)

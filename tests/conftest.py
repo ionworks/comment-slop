@@ -9,6 +9,16 @@ recipe default was not enough.
 
 import os
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _default_mode(monkeypatch):
+    """Unset COMMENT_SLOP_STRICT, or a session launched with it set would run
+    every test that calls `main` or the wrapper in strict mode."""
+    monkeypatch.delenv("COMMENT_SLOP_STRICT", raising=False)
+
+
 collect_ignore = (
     []
     if os.environ.get("COMMENT_SLOP_ORACLE_STRICT")
